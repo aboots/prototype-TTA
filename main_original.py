@@ -124,10 +124,6 @@ ppnet = ppnet.to(device)
 model_ema = None
 class_specific = True
 
-# track best model over all training phases
-best_accu = 0.0
-best_model_path = os.path.join(model_dir, 'best_model.pth')
-
 # define optimizer
 from settings import joint_optimizer_lrs, joint_lr_step_size, k,stage_2_lrs
 
@@ -205,11 +201,6 @@ for epoch in range(num_train_epochs):
                     class_specific=class_specific, log=log, clst_k=k,sum_cls = sum_cls)
     save.save_model_w_condition(model=ppnet, model_dir=model_dir, model_name=str(epoch) + 'nopush', accu=accu,
                                 target_accu=0.75, log=log)
-    # update global best checkpoint
-    if accu > best_accu:
-        best_accu = accu
-        torch.save(ppnet, best_model_path)
-        log(f'New best model (acc={accu:.4f}) saved to {best_model_path}')
     # version 1, learn slots before push 
 from settings import coefs_slots
 coh_weight = coefs_slots['coh']
@@ -226,11 +217,6 @@ for epoch in range(slots_train_epoch):
     
     save.save_model_w_condition(model=ppnet, model_dir=model_dir, model_name=str(epoch) + 'slots', accu=accu,
                                 target_accu=0.75, log=log)
-    # update global best checkpoint
-    if accu > best_accu:
-        best_accu = accu
-        torch.save(ppnet, best_model_path)
-        log(f'New best model (acc={accu:.4f}) saved to {best_model_path}')
 
 push_greedy.push_prototypes(
         train_push_loader, # pytorch dataloader (must be unnormalized in [0,1])
@@ -250,12 +236,6 @@ accu, tst_loss = tnt.test(model=ppnet, dataloader=test_loader,
 save.save_model_w_condition(model=ppnet, model_dir=model_dir, model_name=str(epoch) + 'push', accu=accu,
                             target_accu=0.0, log=log)
 
-# update global best checkpoint after push stage
-if accu > best_accu:
-    best_accu = accu
-    torch.save(ppnet, best_model_path)
-    log(f'New best model (acc={accu:.4f}) saved to {best_model_path}')
-
 for epoch in range(15):
     tnt.last_only(model=ppnet, log=log)
     log('iteration: \t{0}'.format(epoch))
@@ -266,10 +246,5 @@ for epoch in range(15):
                         class_specific=class_specific, log=log, clst_k = k,sum_cls = sum_cls)
     save.save_model_w_condition(model=ppnet, model_dir=model_dir, model_name=str(epoch) + 'finetuned', accu=accu,
                             target_accu=0.70, log=log)
-    # update global best checkpoint during finetuning
-    if accu > best_accu:
-        best_accu = accu
-        torch.save(ppnet, best_model_path)
-        log(f'New best model (acc={accu:.4f}) saved to {best_model_path}')
 logclose()
 

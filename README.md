@@ -1,7 +1,7 @@
 # ProtoViT: Interpretable Image Classification with Adaptive Prototype-based Vision Transformers
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.x-red.svg)](https://pytorch.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 This repository contains the official implementation of the paper ["**Interpretable Image Classification with Adaptive Prototype-based Vision Transformers**"](https://arxiv.org/abs/2410.20722). **(NeurIPS 2024)**
@@ -29,13 +29,14 @@ ProtoViT is a novel approach that combines Vision Transformers with prototype-ba
 
 ### Software Requirements
 
-These packages should be enough to reproduce our results. We add requirement.txt based on our conda environment for reference just in case. 
-- Python 3.8+
-- PyTorch with cuda
+We recommend using a conda environment with Python 3.10:
+- Python 3.10
+- CUDA-capable GPU and drivers (for GPU training)
+- PyTorch with CUDA support (for NVIDIA B200 we tested with PyTorch 2.9.0 + CUDA 12.8 wheels)
 - NumPy
 - OpenCV (cv2)
 - [Augmentor](https://github.com/mdbloice/Augmentor)
-- Timm==0.4.12 (Note: Higher versions may require modifications to the ViT encoder)
+- timm==0.4.12 (Note: higher versions may require modifications to the ViT encoder)
 
 ### Hardware Requirements
 Recommended GPU configurations:
@@ -45,11 +46,32 @@ Recommended GPU configurations:
 
 ## Installation
 
+We recommend the following steps to recreate a working environment.  
+For NVIDIA B200 GPUs (CUDA 12.8), we use the official PyTorch wheels with CUDA 12.8 support.
+
 ```bash
 git clone https://github.com/Henrymachiyu/ProtoViT.git
 cd ProtoViT
+
+# 1) Create and activate a conda environment (Python 3.10)
+conda create -n protovit python=3.10 -y
+conda activate protovit
+
+# 2) Install PyTorch with CUDA 12.8 (adjust according to your hardware if needed).
+# For B200 GPUs, follow the command from https://pytorch.org/get-started/locally/.
+# Example (as of writing) using official cu128 wheels:
+pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# 3) Install all remaining Python dependencies via pip
 pip install -r requirements.txt
 ```
+
+The `requirements.txt` is a standard pip-style file and:
+- Contains the Python-level dependencies used in our experiments (e.g., timm, transformers, cleverhans, etc.).
+- Includes `cmake` and `lit`, which are required when `triton` (used by recent PyTorch versions) is installed via pip and avoids warnings such as:
+  - `triton ... requires cmake, which is not installed.`
+  - `triton ... requires lit, which is not installed.`
 
 ## Dataset Preparation
 
