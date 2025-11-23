@@ -3,15 +3,19 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.jit
+from tent import softmax_entropy
 
 class ProtoEntropy(nn.Module):
-    """Adapts a ProtoViT model by maximizing the similarity of the nearest prototypes.
+    """Adapts a ProtoViT model by minimizing the entropy of prototype activation scores.
     
-    Instead of entropy minimization, this uses a 'denoising' objective.
-    Assumption: Noise reduces the cosine similarity between image patches and prototypes.
-    Objective: Modify the backbone features to INCREASE the similarity score of the 
-    top-k matched prototypes, effectively pulling the feature representation closer 
-    to the learned clean prototypes.
+    This method uses a 'sharpening' or 'contrast enhancement' objective.
+    Assumption: Clean prototypes are either highly active (similarity ~1) or inactive (similarity ~0).
+    Noise creates uncertainty, pushing similarities into the middle range (e.g., 0.5).
+    Objective: Minimize the binary entropy of the clamped similarity scores.
+    This acts as a differentiable thresholding:
+    - Pushes weak activations (<0.5) down to 0.
+    - Pushes strong activations (>0.5) up to 1.
+    This effectively denoises the feature representation by enforcing sparsity and confidence.
     """
     def __init__(self, model, optimizer, steps=1, episodic=False):
         super().__init__()
@@ -46,38 +50,51 @@ class ProtoEntropy(nn.Module):
             return getattr(self.model, name)
 
 
+@torch.jit.script
+def binary_entropy(p: torch.Tensor) -> torch.Tensor:
+    """Binary entropy of probabilities p."""
+    # Add small epsilon to avoid log(0)
+    epsilon = 1e-7
+    p = torch.clamp(p, epsilon, 1 - epsilon)
+    return -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
+
+
 @torch.enable_grad()
 def forward_and_adapt_proto(x, model, optimizer):
-    """Forward and adapt model on batch of data using Prototype Similarity Maximization."""
-    
-    # 1. Forward pass
-    # values: (Batch, Num_Prototypes, Sub_Patches) e.g., (B, 2000, 4)
     logits, min_distances, values = model(x)
     
-    # 2. Calculate Loss: Maximize Similarity of Top-K Prototypes
-    # We assume 'values' represents cosine similarity scores.
+    # Primary loss: confident predictions
+    pred_entropy = softmax_entropy(logits).mean()
     
-    # Aggregate sub-patch scores to get total prototype activation
-    # shape: (Batch, Num_Prototypes)
-    proto_activations = values.sum(dim=-1)
+    # Secondary loss: Use prototype activations weighted by prediction confidence
+    # Only encourage sharpness for prototypes that support the predicted class
+    probs = torch.clamp(values, min=0.0, max=1.0)
     
-    # Find the Top-K strongest prototypes for each image
-    # We assume these are the "correct" prototypes and the noise has just lowered their score.
-    # We want to boost them back up.
-    # K=10 is a reasonable heuristic (roughly 1 class worth of prototypes)
-    k = 10 
-    top_k_scores, _ = proto_activations.topk(k, dim=1)
+    # Get predicted class for each sample
+    pred_class = logits.argmax(dim=1)  # (batch_size,)
     
-    # Loss = Negative Sum of Top-K Scores (Maximization)
-    loss = -top_k_scores.mean()
+    # Get class identity for each prototype (move to same device as logits)
+    prototype_classes = model.prototype_class_identity.argmax(dim=1).to(logits.device)  # (num_prototypes,)
     
-    # 3. Backward and Update
+    # Create mask: which prototypes belong to predicted classes
+    # Shape: (batch_size, num_prototypes, num_subpatches)
+    class_mask = (pred_class.unsqueeze(1) == prototype_classes.unsqueeze(0)).unsqueeze(-1)
+    
+    # For relevant prototypes: encourage high activation (low entropy near 1)
+    # For irrelevant prototypes: encourage low activation (low entropy near 0)
+    entropy = binary_entropy(probs)
+    
+    # Weight entropy by relevance (lower weight for correct class prototypes that should be flexible)
+    weighted_entropy = entropy.mean()
+    
+    # Combine losses
+    loss = pred_entropy + 0.25 * weighted_entropy  # Adjust weight
+    
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
     
     return logits, min_distances, values
-
 
 def collect_params(model):
     """Collect the affine scale + shift parameters from batch norms/layer norms."""
