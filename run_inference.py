@@ -13,6 +13,7 @@ from settings import img_size, test_dir, test_batch_size, k, sum_cls
 from preprocess import mean, std
 from noise_utils import get_corrupted_transform
 import tent
+import proto_entropy
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +63,20 @@ def setup_tent(model):
     logger.info(f"optimizer for adaptation: %s", optimizer)
     return tent_model
 
+def setup_proto_entropy(model):
+    """Set up Prototype Entropy adaptation.
+    """
+    model = proto_entropy.configure_model(model)
+    params, param_names = proto_entropy.collect_params(model)
+    optimizer = setup_optimizer(params)
+    # Use the ProtoEntropy wrapper instead of Tent
+    proto_model = proto_entropy.ProtoEntropy(model, optimizer,
+                           steps=cfg.OPTIM.STEPS,
+                           episodic=cfg.MODEL.EPISODIC)
+    logger.info(f"model for adaptation: %s", model)
+    logger.info(f"params for adaptation: %s", param_names)
+    logger.info(f"optimizer for adaptation: %s", optimizer)
+    return proto_model
 
 def evaluate_model(model, loader, description="Inference"):
     """Helper to run evaluation loop."""
@@ -77,7 +92,7 @@ def evaluate_model(model, loader, description="Inference"):
     return accu
 
 
-def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='both'):
+def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all'):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -105,7 +120,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     results = {}
 
     # --- NORMAL INFERENCE ---
-    if mode in ['normal', 'both']:
+    if mode in ['normal', 'all']:
         print(f'\n>>> Loading model for NORMAL inference from {model_path}')
         if not os.path.exists(model_path):
              raise FileNotFoundError(f"Model not found at {model_path}")
@@ -123,7 +138,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         torch.cuda.empty_cache()
 
     # --- TENT INFERENCE ---
-    if mode in ['tent', 'both']:
+    if mode in ['tent', 'all']:
         print(f'\n>>> Loading model for TENT inference from {model_path}')
         if not os.path.exists(model_path):
              raise FileNotFoundError(f"Model not found at {model_path}")
@@ -143,6 +158,27 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         del tent_model
         torch.cuda.empty_cache()
 
+    # --- PROTO ENTROPY INFERENCE ---
+    if mode in ['proto', 'all']:
+        print(f'\n>>> Loading model for PROTO ENTROPY inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+        
+        # Setup ProtoEntropy
+        print("Setting up ProtoEntropy adaptation...")
+        proto_model = setup_proto_entropy(base_model)
+        
+        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
+        results['ProtoEntropy'] = acc
+        
+        # Clean up
+        del proto_model
+        torch.cuda.empty_cache()
+
     # --- FINAL SUMMARY ---
     print("\n" + "="*50)
     print("FINAL RESULTS SUMMARY")
@@ -153,34 +189,26 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     print("-" * 50)
     
     if 'Normal' in results:
-        print(f"Normal Accuracy: {results['Normal']*100:.2f}%")
+        print(f"Normal       Accuracy: {results['Normal']*100:.2f}%")
     if 'Tent' in results:
-        print(f"Tent   Accuracy: {results['Tent']*100:.2f}%")
+        print(f"Tent         Accuracy: {results['Tent']*100:.2f}%")
+    if 'ProtoEntropy' in results:
+        print(f"ProtoEntropy Accuracy: {results['ProtoEntropy']*100:.2f}%")
     
-    if 'Normal' in results and 'Tent' in results:
-        diff = (results['Tent'] - results['Normal']) * 100
-        print("-" * 50)
-        print(f"Difference: {diff:+.2f}%")
-        if diff < 0:
-            print("Tent degraded performance.")
-        else:
-            print("Tent improved performance.")
     print("="*50)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal & Tent)')
+    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal & Tent & ProtoEntropy)')
     
     default_model_path = './saved_models/deit_small_patch16_224/exp1/14finetuned0.8609.pth'
     
     parser.add_argument('-model', type=str, default=default_model_path, help='Path to the saved model file')
     parser.add_argument('-gpuid', type=str, default='0', help='GPU ID to use')
     parser.add_argument('-corruption', type=str, default='gaussian_noise', help='Type of corruption to apply')
-    parser.add_argument('-severity', type=int, default=4, help='Severity of corruption (1-5)')
-    parser.add_argument('-mode', type=str, default='both', choices=['normal', 'tent', 'both'], help='Inference mode: normal, tent, or both')
+    parser.add_argument('-severity', type=int, default=5, help='Severity of corruption (1-5)')
+    parser.add_argument('-mode', type=str, default='all', choices=['normal', 'tent', 'proto', 'all'], help='Inference mode: normal, tent, proto, or all')
     
     args = parser.parse_args()
     
     run_unified_inference(args.model, args.gpuid, args.corruption, args.severity, args.mode)
-
-
