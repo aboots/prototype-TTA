@@ -90,6 +90,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     print(f'Loading test data from: {test_dir}')
     if corruption:
         print(f'Applying corruption: {corruption} (Severity: {severity})')
+    else:
+        print('Applying NO corruption (Clean Data)')
     
     transform = get_corrupted_transform(img_size, mean, std, corruption, severity)
     
@@ -100,32 +102,71 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
 
     print(f'Test set size: {len(test_loader.dataset)}')
     
-    # Common model loading logic
-    print(f'Loading model from {model_path}')
-    if not os.path.exists(model_path):
-         raise FileNotFoundError(f"Model not found at {model_path}")
+    results = {}
 
-    # Load base model
-    # Using weights_only=False as established previously
-    base_model = torch.load(model_path, weights_only=False)
-    base_model = base_model.to(device)
-    base_model.eval()
-
-    # Run requested modes
+    # --- NORMAL INFERENCE ---
     if mode in ['normal', 'both']:
-        # Reload/Copy model to ensure clean state for normal inference
-        # (Although base_model is not modified by simple inference, good practice if we share objects)
-        evaluate_model(base_model, test_loader, description="Normal Inference (No Adaptation)")
+        print(f'\n>>> Loading model for NORMAL inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
 
-    if mode in ['tent', 'both']:
-        # Create a fresh copy/load for Tent to ensure we don't adapt the 'normal' model instance accidentally
-        # if we were running them in parallel or sequence with shared state. 
-        # Since we just ran normal inference, base_model is still 'clean' but let's be safe.
-        # We wrap the existing base_model.
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+        base_model.eval()
+
+        acc = evaluate_model(base_model, test_loader, description="Normal Inference (No Adaptation)")
+        results['Normal'] = acc
         
+        # Clean up to free memory
+        del base_model
+        torch.cuda.empty_cache()
+
+    # --- TENT INFERENCE ---
+    if mode in ['tent', 'both']:
+        print(f'\n>>> Loading model for TENT inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        # Load clean model fresh from disk (IMPORTANT: start from same state)
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+        
+        # Setup Tent (this switches mode to train for norm layers)
         print("Setting up Tent adaptation...")
         tent_model = setup_tent(base_model)
-        evaluate_model(tent_model, test_loader, description="Tent Adaptation Inference")
+        
+        acc = evaluate_model(tent_model, test_loader, description="Tent Adaptation Inference")
+        results['Tent'] = acc
+        
+        # Clean up
+        del tent_model
+        torch.cuda.empty_cache()
+
+    # --- FINAL SUMMARY ---
+    print("\n" + "="*50)
+    print("FINAL RESULTS SUMMARY")
+    print("="*50)
+    print(f"Dataset Corruption: {corruption if corruption else 'None'}")
+    if corruption:
+        print(f"Severity: {severity}")
+    print("-" * 50)
+    
+    if 'Normal' in results:
+        print(f"Normal Accuracy: {results['Normal']*100:.2f}%")
+    if 'Tent' in results:
+        print(f"Tent   Accuracy: {results['Tent']*100:.2f}%")
+    
+    if 'Normal' in results and 'Tent' in results:
+        diff = (results['Tent'] - results['Normal']) * 100
+        print("-" * 50)
+        print(f"Difference: {diff:+.2f}%")
+        if diff < 0:
+            print("Tent degraded performance.")
+        else:
+            print("Tent improved performance.")
+    print("="*50)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal & Tent)')
@@ -141,4 +182,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     run_unified_inference(args.model, args.gpuid, args.corruption, args.severity, args.mode)
+
 
