@@ -48,7 +48,7 @@ class ProtoEntropy(nn.Module):
         # -----------------------------------------------------------
         # LOSS 1: Tent (Entropy of the Final Prediction)
         # -----------------------------------------------------------
-        loss_tent = softmax_entropy(logits).mean()
+        # loss_tent = softmax_entropy(logits).mean()
 
         # -----------------------------------------------------------
         # LOSS 2: Prototype Sparsity (Noise Suppression)
@@ -104,7 +104,7 @@ class ProtoEntropy(nn.Module):
         # -----------------------------------------------------------
         # Balance the losses. Sparsity prevents hallucination. Clustering aligns features.
         # Suggested weights: Tent=1.0, Sparsity=0.1, Clustering=0.5
-        loss = loss_tent + 0.1 * loss_sparsity + 0.5 * loss_clustering
+        loss = 0.25 * loss_sparsity + 0.5 * loss_clustering
 
         loss.backward()
         self.optimizer.step()
