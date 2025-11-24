@@ -206,7 +206,7 @@ if __name__ == '__main__':
     parser.add_argument('-model', type=str, default=default_model_path, help='Path to the saved model file')
     parser.add_argument('-gpuid', type=str, default='0', help='GPU ID to use')
     parser.add_argument('-corruption', type=str, default='gaussian_noise', help='Type of corruption to apply')
-    parser.add_argument('-severity', type=int, default=4, help='Severity of corruption (1-5)')
+    parser.add_argument('-severity', type=int, default=5, help='Severity of corruption (1-5)')
     parser.add_argument('-mode', type=str, default='all', choices=['normal', 'tent', 'proto', 'all'], help='Inference mode: normal, tent, proto, or all')
     
     args = parser.parse_args()
