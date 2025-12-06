@@ -14,6 +14,9 @@ from preprocess import mean, std
 from noise_utils import get_corrupted_transform
 import tent
 import proto_entropy
+import loss_adapt
+import fisher_proto
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -58,25 +61,84 @@ def setup_tent(model):
     tent_model = tent.Tent(model, optimizer,
                            steps=cfg.OPTIM.STEPS,
                            episodic=cfg.MODEL.EPISODIC)
-    logger.info(f"model for adaptation: %s", model)
-    logger.info(f"params for adaptation: %s", param_names)
-    logger.info(f"optimizer for adaptation: %s", optimizer)
+    # logger.info(f"model for adaptation: %s", model)
+    # logger.info(f"params for adaptation: %s", param_names)
+    # logger.info(f"optimizer for adaptation: %s", optimizer)
     return tent_model
 
+
 def setup_proto_entropy(model):
-    """Set up Prototype Entropy adaptation.
-    """
+    """Set up Prototype Entropy adaptation."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
     optimizer = setup_optimizer(params)
-    # Use the ProtoEntropy wrapper instead of Tent
-    proto_model = proto_entropy.ProtoEntropy(model, optimizer,
-                           steps=cfg.OPTIM.STEPS,
-                           episodic=cfg.MODEL.EPISODIC)
-    logger.info(f"model for adaptation: %s", model)
-    logger.info(f"params for adaptation: %s", param_names)
-    logger.info(f"optimizer for adaptation: %s", optimizer)
+    proto_model = proto_entropy.ProtoEntropy(
+        model,
+        optimizer,
+        steps=cfg.OPTIM.STEPS,
+        episodic=cfg.MODEL.EPISODIC
+    )
+    # logger.info(f"model for adaptation: %s", model)
+    # logger.info(f"params for adaptation: %s", param_names)
+    # logger.info(f"optimizer for adaptation: %s", optimizer)
     return proto_model
+
+
+def setup_loss_adapt(model):
+    """Set up Loss-based adaptation."""
+    model = loss_adapt.configure_model(model)
+    params, param_names = loss_adapt.collect_params(model)
+    optimizer = setup_optimizer(params)
+    loss_model = loss_adapt.LossAdapt(
+        model,
+        optimizer,
+        steps=cfg.OPTIM.STEPS,
+        episodic=cfg.MODEL.EPISODIC
+    )
+    # logger.info(f"model for adaptation: %s", model)
+    # logger.info(f"params for adaptation: %s", param_names)
+    # logger.info(f"optimizer for adaptation: %s", optimizer)
+    return loss_model
+
+
+def setup_fisher_proto(model):
+    """Set up Fisher-guided prototype adaptation."""
+    model = fisher_proto.configure_model(model)
+    params, param_names = fisher_proto.collect_params(model)
+    optimizer = setup_optimizer(params)
+    fisher_model = fisher_proto.FisherProto(
+        model,
+        optimizer,
+        steps=cfg.OPTIM.STEPS,
+        episodic=cfg.MODEL.EPISODIC,
+    )
+    # Ensure wrapper (and its buffers such as fisher_scores) are on the
+    # same device as the underlying model parameters.
+    device = next(model.parameters()).device
+    fisher_model = fisher_model.to(device)
+    # logger.info(f"model for adaptation (Fisher): %s", model)
+    # logger.info(f"params for adaptation (Fisher): %s", param_names)
+    # logger.info(f"optimizer for adaptation (Fisher): %s", optimizer)
+    return fisher_model
+
+def parse_modes(mode_arg: str):
+    """
+    Parse a comma-separated list of modes.
+
+    If empty or contains 'all', all modes are enabled.
+    Valid individual modes: normal, tent, proto, loss, fisher.
+    """
+    if not mode_arg:
+        return {"normal", "tent", "proto", "loss", "fisher"}
+
+    raw = [m.strip().lower() for m in mode_arg.split(",") if m.strip()]
+    modes = set(raw)
+    if "all" in modes:
+        return {"normal", "tent", "proto", "loss", "fisher"}
+
+    valid = {"normal", "tent", "proto", "loss", "fisher"}
+    selected = modes & valid
+    return selected or valid
 
 def evaluate_model(model, loader, description="Inference"):
     """Helper to run evaluation loop."""
@@ -92,7 +154,7 @@ def evaluate_model(model, loader, description="Inference"):
     return accu
 
 
-def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all'):
+def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', use_pre_generated=True):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -102,25 +164,51 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     print(f'Device: {device}')
 
     # Data loading
-    print(f'Loading test data from: {test_dir}')
     if corruption:
-        print(f'Applying corruption: {corruption} (Severity: {severity})')
+        # Check if pre-generated corrupted dataset exists
+        corrupted_data_dir = Path('./datasets/cub200_c')
+        corruption_path = corrupted_data_dir / corruption / str(severity)
+        
+        if use_pre_generated and corruption_path.exists():
+            print(f'Using PRE-GENERATED corrupted images from: {corruption_path}')
+            # Load pre-generated corrupted dataset (corruption already applied)
+            transform = transforms.Compose([
+                transforms.Resize(size=(img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)
+            ])
+            test_dataset = datasets.ImageFolder(str(corruption_path), transform)
+        else:
+            if use_pre_generated:
+                print(f'Pre-generated corrupted images not found at {corruption_path}')
+            print(f'Generating corruption ON-THE-FLY: {corruption} (Severity: {severity})')
+            print(f'Loading clean images from: {test_dir}')
+            transform = get_corrupted_transform(img_size, mean, std, corruption, severity)
+            test_dataset = datasets.ImageFolder(test_dir, transform)
     else:
         print('Applying NO corruption (Clean Data)')
+        print(f'Loading test data from: {test_dir}')
+        transform = get_corrupted_transform(img_size, mean, std, None, severity)
+        test_dataset = datasets.ImageFolder(test_dir, transform)
     
-    transform = get_corrupted_transform(img_size, mean, std, corruption, severity)
-    
-    test_dataset = datasets.ImageFolder(test_dir, transform)
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=test_batch_size, shuffle=False,
-        num_workers=4, pin_memory=False)
+        num_workers=8, pin_memory=False)
 
     print(f'Test set size: {len(test_loader.dataset)}')
     
     results = {}
 
+    # Determine which modes to run (supports comma-separated list).
+    selected_modes = parse_modes(mode)
+    run_normal = "normal" in selected_modes
+    run_tent = "tent" in selected_modes
+    run_proto = "proto" in selected_modes
+    run_loss = "loss" in selected_modes
+    run_fisher = "fisher" in selected_modes
+
     # --- NORMAL INFERENCE ---
-    if mode in ['normal', 'all']:
+    if run_normal:
         print(f'\n>>> Loading model for NORMAL inference from {model_path}')
         if not os.path.exists(model_path):
              raise FileNotFoundError(f"Model not found at {model_path}")
@@ -138,7 +226,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         torch.cuda.empty_cache()
 
     # --- TENT INFERENCE ---
-    if mode in ['tent', 'all']:
+    if run_tent:
         print(f'\n>>> Loading model for TENT inference from {model_path}')
         if not os.path.exists(model_path):
              raise FileNotFoundError(f"Model not found at {model_path}")
@@ -159,7 +247,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         torch.cuda.empty_cache()
 
     # --- PROTO ENTROPY INFERENCE ---
-    if mode in ['proto', 'all']:
+    if run_proto:
         print(f'\n>>> Loading model for PROTO ENTROPY inference from {model_path}')
         if not os.path.exists(model_path):
              raise FileNotFoundError(f"Model not found at {model_path}")
@@ -167,16 +255,55 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         # Load clean model fresh from disk
         base_model = torch.load(model_path, weights_only=False)
         base_model = base_model.to(device)
-        
+
         # Setup ProtoEntropy
         print("Setting up ProtoEntropy adaptation...")
         proto_model = setup_proto_entropy(base_model)
-        
+
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
         results['ProtoEntropy'] = acc
-        
+
         # Clean up
         del proto_model
+        torch.cuda.empty_cache()
+
+    # --- LOSS ADAPT INFERENCE ---
+    if run_loss:
+        print(f'\n>>> Loading model for LOSS ADAPT inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+        
+        print("Setting up Loss Adapt adaptation...")
+        loss_model = setup_loss_adapt(base_model)
+        
+        acc = evaluate_model(loss_model, test_loader, description="Loss Adapt Inference")
+        results['LossAdapt'] = acc
+        
+        del loss_model
+        torch.cuda.empty_cache()
+
+    # --- FISHER-PROTO INFERENCE ---
+    if run_fisher:
+        print(f'\n>>> Loading model for FISHER PROTO inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        # Setup Fisher-guided prototype adaptation
+        print("Setting up Fisher-guided Proto adaptation...")
+        fisher_model = setup_fisher_proto(base_model)
+
+        acc = evaluate_model(fisher_model, test_loader, description="FisherProto Adaptation Inference")
+        results['FisherProto'] = acc
+
+        # Clean up
+        del fisher_model
         torch.cuda.empty_cache()
 
     # --- FINAL SUMMARY ---
@@ -194,6 +321,10 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print(f"Tent         Accuracy: {results['Tent']*100:.2f}%")
     if 'ProtoEntropy' in results:
         print(f"ProtoEntropy Accuracy: {results['ProtoEntropy']*100:.2f}%")
+    if 'LossAdapt' in results:
+        print(f"LossAdapt    Accuracy: {results['LossAdapt']*100:.2f}%")
+    if 'FisherProto' in results:
+        print(f"FisherProto  Accuracy: {results['FisherProto']*100:.2f}%")
     
     print("="*50)
 
@@ -205,10 +336,39 @@ if __name__ == '__main__':
     
     parser.add_argument('-model', type=str, default=default_model_path, help='Path to the saved model file')
     parser.add_argument('-gpuid', type=str, default='0', help='GPU ID to use')
-    parser.add_argument('-corruption', type=str, default='gaussian_noise', help='Type of corruption to apply')
-    parser.add_argument('-severity', type=int, default=4, help='Severity of corruption (1-5)')
-    parser.add_argument('-mode', type=str, default='all', choices=['normal', 'tent', 'proto', 'all'], help='Inference mode: normal, tent, proto, or all')
+    parser.add_argument('-corruption', type=str, default='gaussian_noise', 
+                       help='Type of corruption to apply (e.g., gaussian_noise). Use None or empty string for clean data (no corruption).')
+    parser.add_argument('-severity', type=int, default=3, help='Severity of corruption (1-5)')
+    parser.add_argument('--no-corruption', action='store_true', 
+                       help='Run inference without any corruption (clean test data)')
+    parser.add_argument(
+        '-mode',
+        type=str,
+        default='all',
+        help=(
+            'Inference mode(s): '
+            'use a comma-separated list of any of [normal, tent, proto, loss, fisher], '
+            'or "all" (default) to run every mode.'
+        ),
+    )
+    parser.add_argument(
+        '--on-the-fly',
+        action='store_true',
+        default=False,
+        help='Force on-the-fly corruption generation (ignore pre-generated images). By default, uses pre-generated images if available.'
+    )
     
     args = parser.parse_args()
     
-    run_unified_inference(args.model, args.gpuid, args.corruption, args.severity, args.mode)
+    # Handle no-corruption flag
+    if args.no_corruption:
+        corruption = None
+    elif args.corruption and args.corruption.lower() in ['none', 'null', '']:
+        corruption = None
+    else:
+        corruption = args.corruption
+    
+    # Determine whether to use pre-generated images (default: True, unless --on-the-fly is set)
+    use_pre_generated = not args.on_the_fly
+    
+    run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, use_pre_generated)

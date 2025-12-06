@@ -27,10 +27,10 @@ class Cfg:
     class Optim:
         def __init__(self):
             self.METHOD = 'Adam'
-            self.LR = 0.001
+            self.LR = 0.01
             self.BETA = 0.9
             self.WD = 0.000
-            self.STEPS = 1
+            self.STEPS = 5
 
     class Model:
         def __init__(self):
