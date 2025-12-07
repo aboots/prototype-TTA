@@ -70,8 +70,8 @@ def setup_tent(model):
     return tent_model
 
 
-def setup_proto_entropy(model, entropy_threshold=None):
-    """Set up Prototype Entropy adaptation."""
+def setup_proto_entropy(model):
+    """Set up Prototype Entropy adaptation (without threshold)."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
     optimizer = setup_optimizer(params)
@@ -79,12 +79,23 @@ def setup_proto_entropy(model, entropy_threshold=None):
         model,
         optimizer,
         steps=cfg.OPTIM.STEPS,
+        episodic=cfg.MODEL.EPISODIC
+    )
+    return proto_model
+
+
+def setup_proto_entropy_eata(model, entropy_threshold=0.4):
+    """Set up Prototype Entropy adaptation with EATA-style thresholding."""
+    model = proto_entropy.configure_model(model)
+    params, param_names = proto_entropy.collect_params(model)
+    optimizer = setup_optimizer(params)
+    proto_model = proto_entropy.ProtoEntropyEATA(
+        model,
+        optimizer,
+        steps=cfg.OPTIM.STEPS,
         episodic=cfg.MODEL.EPISODIC,
         entropy_threshold=entropy_threshold
     )
-    # logger.info(f"model for adaptation: %s", model)
-    # logger.info(f"params for adaptation: %s", param_names)
-    # logger.info(f"optimizer for adaptation: %s", optimizer)
     return proto_model
 
 
@@ -179,17 +190,17 @@ def parse_modes(mode_arg: str):
     Parse a comma-separated list of modes.
 
     If empty or contains 'all', all modes are enabled.
-    Valid individual modes: normal, tent, proto, loss, fisher, eata, memo.
+    Valid individual modes: normal, tent, proto, proto_eata, loss, fisher, eata, sar, memo.
     """
     if not mode_arg:
-        return {"normal", "tent", "proto", "loss", "fisher", "eata", "sar", "memo"}
+        return {"normal", "tent", "proto", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
 
     raw = [m.strip().lower() for m in mode_arg.split(",") if m.strip()]
     modes = set(raw)
     if "all" in modes:
-        return {"normal", "tent", "proto", "loss", "fisher", "eata", "sar", "memo"}
+        return {"normal", "tent", "proto", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
 
-    valid = {"normal", "tent", "proto", "loss", "fisher", "eata", "sar", "memo"}
+    valid = {"normal", "tent", "proto", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
     selected = modes & valid
     return selected or valid
 
@@ -257,6 +268,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     run_normal = "normal" in selected_modes
     run_tent = "tent" in selected_modes
     run_proto = "proto" in selected_modes
+    run_proto_eata = "proto_eata" in selected_modes
     run_loss = "loss" in selected_modes
     run_fisher = "fisher" in selected_modes
     run_eata = "eata" in selected_modes
@@ -312,15 +324,36 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = torch.load(model_path, weights_only=False)
         base_model = base_model.to(device)
 
-        # Setup ProtoEntropy
-        print(f"Setting up ProtoEntropy adaptation (threshold={proto_threshold})...")
-        proto_model = setup_proto_entropy(base_model, entropy_threshold=proto_threshold)
+        # Setup ProtoEntropy (without threshold)
+        print("Setting up ProtoEntropy adaptation (without threshold)...")
+        proto_model = setup_proto_entropy(base_model)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
         results['ProtoEntropy'] = acc
 
         # Clean up
         del proto_model
+        torch.cuda.empty_cache()
+
+    # --- PROTO ENTROPY+EATA INFERENCE ---
+    if run_proto_eata:
+        print(f'\n>>> Loading model for PROTO ENTROPY+EATA inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        # Setup ProtoEntropy with EATA threshold
+        print(f"Setting up ProtoEntropy+EATA adaptation (threshold={proto_threshold})...")
+        proto_eata_model = setup_proto_entropy_eata(base_model, entropy_threshold=proto_threshold)
+
+        acc = evaluate_model(proto_eata_model, test_loader, description="ProtoEntropy+EATA Adaptation Inference")
+        results['ProtoEntropy+EATA'] = acc
+
+        # Clean up
+        del proto_eata_model
         torch.cuda.empty_cache()
 
     # --- LOSS ADAPT INFERENCE ---
@@ -468,25 +501,29 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     print("-" * 50)
     
     if 'Normal' in results:
-        print(f"Normal       Accuracy: {results['Normal']*100:.2f}%")
+        print(f"Normal            Accuracy: {results['Normal']*100:.2f}%")
     if 'Tent' in results:
-        print(f"Tent         Accuracy: {results['Tent']*100:.2f}%")
+        print(f"Tent              Accuracy: {results['Tent']*100:.2f}%")
     if 'ProtoEntropy' in results:
-        print(f"ProtoEntropy Accuracy: {results['ProtoEntropy']*100:.2f}%")
+        print(f"ProtoEntropy      Accuracy: {results['ProtoEntropy']*100:.2f}%")
+    if 'ProtoEntropy+EATA' in results:
+        print(f"ProtoEntropy+EATA Accuracy: {results['ProtoEntropy+EATA']*100:.2f}%")
     if 'LossAdapt' in results:
-        print(f"LossAdapt    Accuracy: {results['LossAdapt']*100:.2f}%")
+        print(f"LossAdapt         Accuracy: {results['LossAdapt']*100:.2f}%")
     if 'FisherProto' in results:
-        print(f"FisherProto  Accuracy: {results['FisherProto']*100:.2f}%")
+        print(f"FisherProto       Accuracy: {results['FisherProto']*100:.2f}%")
     if 'EATA' in results:
-        print(f"EATA         Accuracy: {results['EATA']*100:.2f}%")
+        print(f"EATA              Accuracy: {results['EATA']*100:.2f}%")
     if 'SAR' in results:
-        print(f"SAR          Accuracy: {results['SAR']*100:.2f}%")
+        print(f"SAR               Accuracy: {results['SAR']*100:.2f}%")
+    if 'MEMO' in results:
+        print(f"MEMO              Accuracy: {results['MEMO']*100:.2f}%")
     
     print("="*50)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal, Tent, ProtoEntropy, Loss, Fisher, EATA, MEMO)')
+    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal, Tent, ProtoEntropy, ProtoEntropy+EATA, Loss, Fisher, EATA, SAR, MEMO)')
     
     default_model_path = './saved_models/deit_small_patch16_224/exp1/14finetuned0.8609.pth'
     
@@ -503,7 +540,7 @@ if __name__ == '__main__':
         default='all',
         help=(
             'Inference mode(s): '
-            'use a comma-separated list of any of [normal, tent, proto, loss, fisher, eata, sar, memo], '
+            'use a comma-separated list of any of [normal, tent, proto, proto_eata, loss, fisher, eata, sar, memo], '
             'or "all" (default) to run every mode.'
         ),
     )
@@ -524,8 +561,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--proto-threshold',
         type=float,
-        default=None,
-        help='Entropy threshold for ProtoEntropy adaptation (e.g., 0.4). Samples with higher entropy are ignored.'
+        default=0.4,
+        help='Entropy threshold for ProtoEntropy+EATA adaptation (default: 0.4). Samples with higher entropy are ignored.'
     )
     
     args = parser.parse_args()

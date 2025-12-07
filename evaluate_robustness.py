@@ -94,12 +94,20 @@ def setup_tent(model):
     return tent.Tent(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
 
 
-def setup_proto_entropy(model, entropy_threshold=None):
-    """Set up ProtoEntropy adaptation."""
+def setup_proto_entropy(model):
+    """Set up ProtoEntropy adaptation (without threshold)."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
     optimizer = setup_optimizer(params)
-    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC, entropy_threshold=entropy_threshold)
+    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+
+
+def setup_proto_entropy_eata(model, entropy_threshold=0.4):
+    """Set up ProtoEntropy adaptation with EATA-style thresholding."""
+    model = proto_entropy.configure_model(model)
+    params, param_names = proto_entropy.collect_params(model)
+    optimizer = setup_optimizer(params)
+    return proto_entropy.ProtoEntropyEATA(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC, entropy_threshold=entropy_threshold)
 
 
 def setup_loss_adapt(model):
@@ -279,7 +287,9 @@ def evaluate_corruption(model_path, corruption_type, severity, data_dir,
             elif mode == 'tent':
                 eval_model = setup_tent(base_model)
             elif mode == 'proto':
-                eval_model = setup_proto_entropy(base_model, entropy_threshold=proto_threshold)
+                eval_model = setup_proto_entropy(base_model)
+            elif mode == 'proto_eata':
+                eval_model = setup_proto_entropy_eata(base_model, entropy_threshold=proto_threshold)
             elif mode == 'loss':
                 eval_model = setup_loss_adapt(base_model)
             elif mode == 'fisher':
@@ -323,7 +333,7 @@ def compute_metrics(results_dict):
     """
     metrics = {}
     
-    for mode in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata', 'sar', 'memo']:
+    for mode in ['normal', 'tent', 'proto', 'proto_eata', 'loss', 'fisher', 'eata', 'sar', 'memo']:
         if mode not in results_dict:
             continue
         
@@ -370,7 +380,7 @@ def print_results_table(results_dict, metrics, clean_results=None):
     print("Per-Corruption Results (all severities)")
     print("="*80)
     
-    modes = [m for m in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata', 'sar'] if m in results_dict]
+    modes = [m for m in ['normal', 'tent', 'proto', 'proto_eata', 'loss', 'fisher', 'eata', 'sar', 'memo'] if m in results_dict]
     
     if not modes:
         print("No results to display.")
@@ -457,7 +467,7 @@ def main():
     parser.add_argument('--severities', nargs='+', type=int, default=[2, 3, 4, 5],
                        help='Severity levels to evaluate (1-5)')
     parser.add_argument('--mode', type=str, default='all',
-                       help='Evaluation modes: normal, tent, proto, loss, fisher, eata, sar, memo, or "all" (comma-separated)')
+                       help='Evaluation modes: normal, tent, proto, proto_eata, loss, fisher, eata, sar, memo, or "all" (comma-separated)')
     
     # Data loading
     parser.add_argument('--on_the_fly', action='store_true',
@@ -479,8 +489,8 @@ def main():
     parser.add_argument('--use_clean_fisher', action='store_true', default=False,
                        help='Use clean data to compute Fisher Information Matrix for EATA. Default is False (use test data).')
 
-    parser.add_argument('--proto_threshold', type=float, default=None,
-                       help='Entropy threshold for ProtoEntropy adaptation (e.g. 0.4).')
+    parser.add_argument('--proto_threshold', type=float, default=0.4,
+                       help='Entropy threshold for ProtoEntropy+EATA adaptation (default: 0.4).')
 
     args = parser.parse_args()
     
@@ -497,7 +507,7 @@ def main():
     
     # Determine modes
     if args.mode.lower() == 'all':
-        modes = ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata', 'sar', 'memo']
+        modes = ['normal', 'tent', 'proto', 'proto_eata', 'loss', 'fisher', 'eata', 'sar', 'memo']
     else:
         modes = [m.strip().lower() for m in args.mode.split(',')]
     
@@ -588,7 +598,9 @@ def main():
             elif mode == 'tent':
                 eval_model = setup_tent(base_model)
             elif mode == 'proto':
-                eval_model = setup_proto_entropy(base_model, entropy_threshold=args.proto_threshold)
+                eval_model = setup_proto_entropy(base_model)
+            elif mode == 'proto_eata':
+                eval_model = setup_proto_entropy_eata(base_model, entropy_threshold=args.proto_threshold)
             elif mode == 'loss':
                 eval_model = setup_loss_adapt(base_model)
             elif mode == 'fisher':
@@ -607,6 +619,8 @@ def main():
                 eval_model = setup_eata(base_model, fishers)
             elif mode == 'sar':
                 eval_model = setup_sar(base_model)
+            elif mode == 'memo':
+                eval_model = setup_memo(base_model, lr=0.00025, batch_size=64, steps=1)
             
             acc = evaluate_model(eval_model, clean_loader, 
                                description=f"Clean data - {mode.capitalize()}")
