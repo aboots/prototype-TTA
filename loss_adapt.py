@@ -5,15 +5,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LossAdapt(nn.Module):
-    def __init__(self, model, optimizer, steps=1, episodic=False):
+    def __init__(self, model, optimizer, steps=1, episodic=False, sparsity_weight=0.0, clustering_weight=0.1):
         super().__init__()
         self.model = model
         self.optimizer = optimizer
         self.steps = steps
         self.episodic = episodic
+        self.sparsity_weight = sparsity_weight
+        self.clustering_weight = clustering_weight
         # Cache initial state
         self.model_state, self.optimizer_state = \
             copy_model_and_optimizer(self.model, self.optimizer)
+        print(f"Sparsity weight: {sparsity_weight}, Clustering weight: {clustering_weight}")
 
     def forward(self, x):
         if self.episodic:
@@ -98,7 +101,7 @@ class LossAdapt(nn.Module):
         # -----------------------------------------------------------
         # Balance the losses. Sparsity prevents hallucination. Clustering aligns features.
         # Suggested weights: Sparsity=0.1, Clustering=0.5
-        loss = 0.25 * loss_sparsity + 0.5 * loss_clustering
+        loss = self.sparsity_weight * loss_sparsity + self.clustering_weight * loss_clustering
 
         loss.backward()
         self.optimizer.step()

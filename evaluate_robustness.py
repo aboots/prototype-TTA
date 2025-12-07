@@ -44,6 +44,8 @@ import tent
 import proto_entropy
 import loss_adapt
 import fisher_proto
+import eata_adapt
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -90,12 +92,12 @@ def setup_tent(model):
     return tent.Tent(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
 
 
-def setup_proto_entropy(model):
+def setup_proto_entropy(model, entropy_threshold=None):
     """Set up ProtoEntropy adaptation."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
     optimizer = setup_optimizer(params)
-    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC, entropy_threshold=entropy_threshold)
 
 
 def setup_loss_adapt(model):
@@ -114,6 +116,15 @@ def setup_fisher_proto(model):
     fisher_model = fisher_proto.FisherProto(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
     device = next(model.parameters()).device
     return fisher_model.to(device)
+
+
+def setup_eata(model, fishers):
+    """Set up EATA adaptation."""
+    model = eata_adapt.configure_model(model)
+    params, param_names = eata_adapt.collect_params(model)
+    optimizer = setup_optimizer(params)
+    return eata_adapt.EATA(model, optimizer, fishers=fishers, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+
 
 
 def evaluate_model(model, loader, description="Inference", verbose=True):
@@ -181,7 +192,7 @@ def load_dataset_with_corruption(clean_data_dir, corruption_type, severity, batc
 
 
 def evaluate_corruption(model_path, corruption_type, severity, data_dir, 
-                       clean_data_dir, on_the_fly, modes, device, batch_size):
+                       clean_data_dir, on_the_fly, modes, device, batch_size, fishers=None, proto_threshold=None):
     """Evaluate model on a single corruption type and severity."""
     results = {}
     
@@ -194,6 +205,27 @@ def evaluate_corruption(model_path, corruption_type, severity, data_dir,
     except Exception as e:
         logger.error(f"Failed to load data for {corruption_type}-{severity}: {e}")
         return None
+
+    # If EATA is requested, compute Fishers on this test data (source-free setting)
+    # We compute it once per corruption-severity setting using the current loader.
+    if 'eata' in modes and fishers is None:
+        try:
+            # Load fresh model for Fisher computation
+            fisher_model = torch.load(model_path, weights_only=False)
+            fisher_model = fisher_model.to(device)
+            fisher_model = eata_adapt.configure_model(fisher_model)
+            
+            # Compute Fishers on first 2000 samples of the current loader
+            # Note: We pass the loader directly; compute_fishers handles early stopping
+            current_fishers = eata_adapt.compute_fishers(fisher_model, loader, device, num_samples=2000)
+            
+            del fisher_model
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"Failed to compute Fishers for {corruption_type}-{severity}: {e}")
+            current_fishers = None
+    else:
+        current_fishers = fishers
     
     # Evaluate each mode
     for mode in modes:
@@ -209,11 +241,15 @@ def evaluate_corruption(model_path, corruption_type, severity, data_dir,
             elif mode == 'tent':
                 eval_model = setup_tent(base_model)
             elif mode == 'proto':
-                eval_model = setup_proto_entropy(base_model)
+                eval_model = setup_proto_entropy(base_model, entropy_threshold=proto_threshold)
             elif mode == 'loss':
                 eval_model = setup_loss_adapt(base_model)
             elif mode == 'fisher':
                 eval_model = setup_fisher_proto(base_model)
+            elif mode == 'eata':
+                if current_fishers is None:
+                    raise ValueError("Fishers could not be computed for EATA")
+                eval_model = setup_eata(base_model, current_fishers)
             else:
                 logger.warning(f"Unknown mode: {mode}")
                 continue
@@ -236,6 +272,7 @@ def evaluate_corruption(model_path, corruption_type, severity, data_dir,
     return results
 
 
+
 def compute_metrics(results_dict):
     """
     Compute mCE (mean Corruption Error) and other aggregate metrics.
@@ -244,7 +281,7 @@ def compute_metrics(results_dict):
     """
     metrics = {}
     
-    for mode in ['normal', 'tent', 'proto', 'loss', 'fisher']:
+    for mode in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata']:
         if mode not in results_dict:
             continue
         
@@ -291,7 +328,7 @@ def print_results_table(results_dict, metrics, clean_results=None):
     print("Per-Corruption Results (all severities)")
     print("="*80)
     
-    modes = [m for m in ['normal', 'tent', 'proto', 'loss', 'fisher'] if m in results_dict]
+    modes = [m for m in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata'] if m in results_dict]
     
     if not modes:
         print("No results to display.")
@@ -396,6 +433,13 @@ def main():
     parser.add_argument('--gpuid', type=str, default='0',
                        help='GPU ID to use')
     
+    # EATA settings
+    parser.add_argument('--use_clean_fisher', action='store_true', default=False,
+                       help='Use clean data to compute Fisher Information Matrix for EATA. Default is False (use test data).')
+
+    parser.add_argument('--proto_threshold', type=float, default=None,
+                       help='Entropy threshold for ProtoEntropy adaptation (e.g. 0.4).')
+
     args = parser.parse_args()
     
     # Setup device
@@ -411,13 +455,51 @@ def main():
     
     # Determine modes
     if args.mode.lower() == 'all':
-        modes = ['normal', 'tent', 'proto', 'loss', 'fisher']
+        modes = ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata']
     else:
         modes = [m.strip().lower() for m in args.mode.split(',')]
     
     # Verify model exists
     if not os.path.exists(args.model):
         raise FileNotFoundError(f"Model not found: {args.model}")
+    
+    # Compute Fishers GLOBAL if requested (Clean Data Access)
+    fishers = None
+    if 'eata' in modes and args.use_clean_fisher:
+        print("\n" + "="*80)
+        print("Computing Fisher Information Matrix on CLEAN data for EATA")
+        print("="*80)
+        
+        # Load model
+        base_model = torch.load(args.model, weights_only=False)
+        base_model = base_model.to(device)
+        
+        # Load clean data (subset)
+        transform_clean = transforms.Compose([
+            transforms.Resize(size=(img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+        clean_dataset = datasets.ImageFolder(args.clean_data_dir, transform_clean)
+        
+        num_fisher_samples = 2000
+        if len(clean_dataset) > num_fisher_samples:
+            fisher_indices = torch.randperm(len(clean_dataset))[:num_fisher_samples]
+            fisher_subset = torch.utils.data.Subset(clean_dataset, fisher_indices)
+        else:
+            fisher_subset = clean_dataset
+            
+        fisher_loader = torch.utils.data.DataLoader(
+            fisher_subset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True
+        )
+        
+        # Configure and compute
+        base_model = eata_adapt.configure_model(base_model)
+        fishers = eata_adapt.compute_fishers(base_model, fisher_loader, device)
+        print("Fisher information computed on CLEAN data.")
+        
+        del base_model
+        torch.cuda.empty_cache()
     
     # Print configuration
     print("="*80)
@@ -464,11 +546,23 @@ def main():
             elif mode == 'tent':
                 eval_model = setup_tent(base_model)
             elif mode == 'proto':
-                eval_model = setup_proto_entropy(base_model)
+                eval_model = setup_proto_entropy(base_model, entropy_threshold=args.proto_threshold)
             elif mode == 'loss':
                 eval_model = setup_loss_adapt(base_model)
             elif mode == 'fisher':
                 eval_model = setup_fisher_proto(base_model)
+            elif mode == 'eata':
+                # For clean data eval, compute Fisher on clean data
+                if fishers is None:
+                    # Compute on clean loader if not provided
+                    print("Computing Fisher on clean data for clean eval...")
+                    fisher_model = torch.load(args.model, weights_only=False)
+                    fisher_model = fisher_model.to(device)
+                    fisher_model = eata_adapt.configure_model(fisher_model)
+                    fishers = eata_adapt.compute_fishers(fisher_model, clean_loader, device, num_samples=2000)
+                    del fisher_model
+                
+                eval_model = setup_eata(base_model, fishers)
             
             acc = evaluate_model(eval_model, clean_loader, 
                                description=f"Clean data - {mode.capitalize()}")
@@ -512,7 +606,9 @@ def main():
                 args.on_the_fly,
                 modes,
                 device,
-                args.batch_size
+                args.batch_size,
+                fishers=fishers,  # Pass globally computed fishers (if any)
+                proto_threshold=args.proto_threshold
             )
             
             if results:

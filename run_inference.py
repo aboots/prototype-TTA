@@ -16,6 +16,7 @@ import tent
 import proto_entropy
 import loss_adapt
 import fisher_proto
+import eata_adapt
 from pathlib import Path
 
 # Configure logging
@@ -67,7 +68,7 @@ def setup_tent(model):
     return tent_model
 
 
-def setup_proto_entropy(model):
+def setup_proto_entropy(model, entropy_threshold=None):
     """Set up Prototype Entropy adaptation."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
@@ -76,7 +77,8 @@ def setup_proto_entropy(model):
         model,
         optimizer,
         steps=cfg.OPTIM.STEPS,
-        episodic=cfg.MODEL.EPISODIC
+        episodic=cfg.MODEL.EPISODIC,
+        entropy_threshold=entropy_threshold
     )
     # logger.info(f"model for adaptation: %s", model)
     # logger.info(f"params for adaptation: %s", param_names)
@@ -121,6 +123,22 @@ def setup_fisher_proto(model):
     # logger.info(f"optimizer for adaptation (Fisher): %s", optimizer)
     return fisher_model
 
+
+def setup_eata(model, fishers):
+    """Set up EATA adaptation."""
+    model = eata_adapt.configure_model(model)
+    params, param_names = eata_adapt.collect_params(model)
+    optimizer = setup_optimizer(params)
+    eata_model = eata_adapt.EATA(
+        model,
+        optimizer,
+        fishers=fishers,
+        steps=cfg.OPTIM.STEPS,
+        episodic=cfg.MODEL.EPISODIC
+    )
+    return eata_model
+
+
 def parse_modes(mode_arg: str):
     """
     Parse a comma-separated list of modes.
@@ -129,14 +147,14 @@ def parse_modes(mode_arg: str):
     Valid individual modes: normal, tent, proto, loss, fisher.
     """
     if not mode_arg:
-        return {"normal", "tent", "proto", "loss", "fisher"}
+        return {"normal", "tent", "proto", "loss", "fisher", "eata"}
 
     raw = [m.strip().lower() for m in mode_arg.split(",") if m.strip()]
     modes = set(raw)
     if "all" in modes:
-        return {"normal", "tent", "proto", "loss", "fisher"}
+        return {"normal", "tent", "proto", "loss", "fisher", "eata"}
 
-    valid = {"normal", "tent", "proto", "loss", "fisher"}
+    valid = {"normal", "tent", "proto", "loss", "fisher", "eata"}
     selected = modes & valid
     return selected or valid
 
@@ -154,7 +172,7 @@ def evaluate_model(model, loader, description="Inference"):
     return accu
 
 
-def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', use_pre_generated=True):
+def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', use_pre_generated=True, use_clean_fisher=False, proto_threshold=None):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -206,6 +224,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     run_proto = "proto" in selected_modes
     run_loss = "loss" in selected_modes
     run_fisher = "fisher" in selected_modes
+    run_eata = "eata" in selected_modes
 
     # --- NORMAL INFERENCE ---
     if run_normal:
@@ -257,8 +276,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy
-        print("Setting up ProtoEntropy adaptation...")
-        proto_model = setup_proto_entropy(base_model)
+        print(f"Setting up ProtoEntropy adaptation (threshold={proto_threshold})...")
+        proto_model = setup_proto_entropy(base_model, entropy_threshold=proto_threshold)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
         results['ProtoEntropy'] = acc
@@ -306,6 +325,55 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         del fisher_model
         torch.cuda.empty_cache()
 
+    # --- EATA INFERENCE ---
+    if run_eata:
+        print(f'\n>>> Loading model for EATA inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        if use_clean_fisher:
+            print("Computing Fisher Information Matrix on CLEAN data (using clean images)...")
+            # Prepare clean data loader for Fisher computation (subset of 2000 samples)
+            transform_clean = get_corrupted_transform(img_size, mean, std, None, 1)
+            clean_dataset = datasets.ImageFolder(test_dir, transform_clean)
+            
+            num_fisher_samples = 2000
+            if len(clean_dataset) > num_fisher_samples:
+                fisher_indices = torch.randperm(len(clean_dataset))[:num_fisher_samples]
+                fisher_subset = torch.utils.data.Subset(clean_dataset, fisher_indices)
+            else:
+                fisher_subset = clean_dataset
+                
+            fisher_loader = torch.utils.data.DataLoader(
+                fisher_subset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True
+            )
+            
+            base_model = eata_adapt.configure_model(base_model)
+            fishers = eata_adapt.compute_fishers(base_model, fisher_loader, device)
+        else:
+            print("Computing Fisher Information Matrix on TEST data (online estimation)...")
+            # Use test loader (corrupted data) to estimate Fishers
+            base_model = eata_adapt.configure_model(base_model)
+            # Compute Fishers on a subset of test data (e.g., first 2000 samples)
+            fishers = eata_adapt.compute_fishers(base_model, test_loader, device, num_samples=500)
+        
+        print("Fisher information computed.")
+
+        # Setup EATA
+        print("Setting up EATA adaptation...")
+        eata_model = setup_eata(base_model, fishers)
+
+        acc = evaluate_model(eata_model, test_loader, description="EATA Adaptation Inference")
+        results['EATA'] = acc
+
+        # Clean up
+        del eata_model
+        torch.cuda.empty_cache()
+
     # --- FINAL SUMMARY ---
     print("\n" + "="*50)
     print("FINAL RESULTS SUMMARY")
@@ -325,6 +393,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print(f"LossAdapt    Accuracy: {results['LossAdapt']*100:.2f}%")
     if 'FisherProto' in results:
         print(f"FisherProto  Accuracy: {results['FisherProto']*100:.2f}%")
+    if 'EATA' in results:
+        print(f"EATA         Accuracy: {results['EATA']*100:.2f}%")
     
     print("="*50)
 
@@ -347,7 +417,7 @@ if __name__ == '__main__':
         default='all',
         help=(
             'Inference mode(s): '
-            'use a comma-separated list of any of [normal, tent, proto, loss, fisher], '
+            'use a comma-separated list of any of [normal, tent, proto, loss, fisher, eata], '
             'or "all" (default) to run every mode.'
         ),
     )
@@ -356,6 +426,20 @@ if __name__ == '__main__':
         action='store_true',
         default=False,
         help='Force on-the-fly corruption generation (ignore pre-generated images). By default, uses pre-generated images if available.'
+    )
+    
+    parser.add_argument(
+        '--use-clean-fisher',
+        action='store_true',
+        default=False,
+        help='Use clean data to compute Fisher Information Matrix for EATA (requires access to clean data). Default is False (use test data).'
+    )
+    
+    parser.add_argument(
+        '--proto-threshold',
+        type=float,
+        default=None,
+        help='Entropy threshold for ProtoEntropy adaptation (e.g., 0.4). Samples with higher entropy are ignored.'
     )
     
     args = parser.parse_args()
@@ -371,4 +455,4 @@ if __name__ == '__main__':
     # Determine whether to use pre-generated images (default: True, unless --on-the-fly is set)
     use_pre_generated = not args.on_the_fly
     
-    run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, use_pre_generated)
+    run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, use_pre_generated, args.use_clean_fisher, args.proto_threshold)
