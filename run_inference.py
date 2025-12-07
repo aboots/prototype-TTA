@@ -17,6 +17,8 @@ import proto_entropy
 import loss_adapt
 import fisher_proto
 import eata_adapt
+import memo_adapt
+import sar_adapt
 from pathlib import Path
 
 # Configure logging
@@ -139,22 +141,55 @@ def setup_eata(model, fishers):
     return eata_model
 
 
+def setup_sar(model):
+    """Set up SAR adaptation."""
+    model = sar_adapt.configure_model(model)
+    params, param_names = sar_adapt.collect_params(model)
+    # SAR uses SAM optimizer with SGD base
+    base_optimizer = torch.optim.SGD
+    optimizer = sar_adapt.SAM(params, base_optimizer, lr=cfg.OPTIM.LR, momentum=0.9)
+    return sar_adapt.SAR(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+
+
+def setup_memo(model, lr=0.00025, batch_size=64, steps=1):
+    """Set up MEMO adaptation.
+    
+    MEMO (Test Time Robustness via Adaptation and Augmentation) adapts
+    the model to each test sample by minimizing the entropy of the marginal
+    distribution over multiple augmented views.
+    """
+    model = memo_adapt.configure_model(model)
+    params, param_names = memo_adapt.collect_params(model)
+    
+    # MEMO uses SGD optimizer with momentum
+    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0)
+    
+    memo_model = memo_adapt.MEMO(
+        model,
+        optimizer,
+        steps=steps,
+        batch_size=batch_size,
+        episodic=True
+    )
+    return memo_model
+
+
 def parse_modes(mode_arg: str):
     """
     Parse a comma-separated list of modes.
 
     If empty or contains 'all', all modes are enabled.
-    Valid individual modes: normal, tent, proto, loss, fisher.
+    Valid individual modes: normal, tent, proto, loss, fisher, eata, memo.
     """
     if not mode_arg:
-        return {"normal", "tent", "proto", "loss", "fisher", "eata"}
+        return {"normal", "tent", "proto", "loss", "fisher", "eata", "sar", "memo"}
 
     raw = [m.strip().lower() for m in mode_arg.split(",") if m.strip()]
     modes = set(raw)
     if "all" in modes:
-        return {"normal", "tent", "proto", "loss", "fisher", "eata"}
+        return {"normal", "tent", "proto", "loss", "fisher", "eata", "sar", "memo"}
 
-    valid = {"normal", "tent", "proto", "loss", "fisher", "eata"}
+    valid = {"normal", "tent", "proto", "loss", "fisher", "eata", "sar", "memo"}
     selected = modes & valid
     return selected or valid
 
@@ -225,6 +260,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     run_loss = "loss" in selected_modes
     run_fisher = "fisher" in selected_modes
     run_eata = "eata" in selected_modes
+    run_sar = "sar" in selected_modes
+    run_memo = "memo" in selected_modes
 
     # --- NORMAL INFERENCE ---
     if run_normal:
@@ -374,6 +411,53 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         del eata_model
         torch.cuda.empty_cache()
 
+    # --- SAR INFERENCE ---
+    if run_sar:
+        print(f'\n>>> Loading model for SAR inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        # Setup SAR
+        print("Setting up SAR adaptation...")
+        sar_model = setup_sar(base_model)
+
+        acc = evaluate_model(sar_model, test_loader, description="SAR Adaptation Inference")
+        results['SAR'] = acc
+
+        # Clean up
+        del sar_model
+        torch.cuda.empty_cache()
+
+    # --- MEMO INFERENCE ---
+    if run_memo:
+        print(f'\n>>> Loading model for MEMO inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        print("Setting up MEMO adaptation...")
+        print("MEMO parameters: lr=0.00025, batch_size=32, steps=1")
+        memo_model = setup_memo(base_model, lr=0.00025, batch_size=32, steps=1)
+        
+        # MEMO requires batch_size=1 (processes one image at a time)
+        memo_loader = torch.utils.data.DataLoader(
+            test_dataset, batch_size=1, shuffle=False,
+            num_workers=4, pin_memory=False)
+
+        acc = evaluate_model(memo_model, memo_loader, description="MEMO Adaptation Inference")
+        results['MEMO'] = acc
+
+        # Clean up
+        del memo_model
+        torch.cuda.empty_cache()
+
     # --- FINAL SUMMARY ---
     print("\n" + "="*50)
     print("FINAL RESULTS SUMMARY")
@@ -395,12 +479,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print(f"FisherProto  Accuracy: {results['FisherProto']*100:.2f}%")
     if 'EATA' in results:
         print(f"EATA         Accuracy: {results['EATA']*100:.2f}%")
+    if 'SAR' in results:
+        print(f"SAR          Accuracy: {results['SAR']*100:.2f}%")
     
     print("="*50)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal & Tent & ProtoEntropy)')
+    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal, Tent, ProtoEntropy, Loss, Fisher, EATA, MEMO)')
     
     default_model_path = './saved_models/deit_small_patch16_224/exp1/14finetuned0.8609.pth'
     
@@ -417,7 +503,7 @@ if __name__ == '__main__':
         default='all',
         help=(
             'Inference mode(s): '
-            'use a comma-separated list of any of [normal, tent, proto, loss, fisher, eata], '
+            'use a comma-separated list of any of [normal, tent, proto, loss, fisher, eata, sar, memo], '
             'or "all" (default) to run every mode.'
         ),
     )

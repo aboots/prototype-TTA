@@ -45,6 +45,8 @@ import proto_entropy
 import loss_adapt
 import fisher_proto
 import eata_adapt
+import memo_adapt
+import sar_adapt
 
 
 # Setup logging
@@ -124,6 +126,42 @@ def setup_eata(model, fishers):
     params, param_names = eata_adapt.collect_params(model)
     optimizer = setup_optimizer(params)
     return eata_adapt.EATA(model, optimizer, fishers=fishers, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+
+
+def setup_sar(model):
+    """Set up SAR adaptation."""
+    model = sar_adapt.configure_model(model)
+    params, param_names = sar_adapt.collect_params(model)
+    # SAR uses SAM optimizer with SGD base
+    base_optimizer = torch.optim.SGD
+    optimizer = sar_adapt.SAM(params, base_optimizer, lr=cfg.OPTIM.LR, momentum=0.9)
+    return sar_adapt.SAR(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+
+
+def setup_memo(model, lr=0.00025, batch_size=64, steps=1):
+    """Set up MEMO adaptation.
+    
+    MEMO (Test Time Robustness via Adaptation and Augmentation) adapts
+    the model to each test sample by minimizing the entropy of the marginal
+    distribution over multiple augmented views.
+    
+    Args:
+        model: The model to adapt
+        lr: Learning rate for adaptation (default: 0.00025)
+        batch_size: Number of augmented views per step (default: 64)
+        steps: Number of adaptation steps per sample (default: 1)
+    
+    Returns:
+        MEMO-wrapped model
+    """
+    model = memo_adapt.configure_model(model)
+    params, param_names = memo_adapt.collect_params(model)
+    
+    # MEMO uses SGD optimizer with momentum
+    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0)
+    
+    return memo_adapt.MEMO(model, optimizer, steps=steps, 
+                          batch_size=batch_size, episodic=True)
 
 
 
@@ -250,6 +288,10 @@ def evaluate_corruption(model_path, corruption_type, severity, data_dir,
                 if current_fishers is None:
                     raise ValueError("Fishers could not be computed for EATA")
                 eval_model = setup_eata(base_model, current_fishers)
+            elif mode == 'sar':
+                eval_model = setup_sar(base_model)
+            elif mode == 'memo':
+                eval_model = setup_memo(base_model, lr=0.00025, batch_size=64, steps=1)
             else:
                 logger.warning(f"Unknown mode: {mode}")
                 continue
@@ -281,7 +323,7 @@ def compute_metrics(results_dict):
     """
     metrics = {}
     
-    for mode in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata']:
+    for mode in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata', 'sar', 'memo']:
         if mode not in results_dict:
             continue
         
@@ -328,7 +370,7 @@ def print_results_table(results_dict, metrics, clean_results=None):
     print("Per-Corruption Results (all severities)")
     print("="*80)
     
-    modes = [m for m in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata'] if m in results_dict]
+    modes = [m for m in ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata', 'sar'] if m in results_dict]
     
     if not modes:
         print("No results to display.")
@@ -415,7 +457,7 @@ def main():
     parser.add_argument('--severities', nargs='+', type=int, default=[2, 3, 4, 5],
                        help='Severity levels to evaluate (1-5)')
     parser.add_argument('--mode', type=str, default='all',
-                       help='Evaluation modes: normal, tent, proto, loss, fisher, or "all" (comma-separated)')
+                       help='Evaluation modes: normal, tent, proto, loss, fisher, eata, sar, memo, or "all" (comma-separated)')
     
     # Data loading
     parser.add_argument('--on_the_fly', action='store_true',
@@ -455,7 +497,7 @@ def main():
     
     # Determine modes
     if args.mode.lower() == 'all':
-        modes = ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata']
+        modes = ['normal', 'tent', 'proto', 'loss', 'fisher', 'eata', 'sar', 'memo']
     else:
         modes = [m.strip().lower() for m in args.mode.split(',')]
     
@@ -563,6 +605,8 @@ def main():
                     del fisher_model
                 
                 eval_model = setup_eata(base_model, fishers)
+            elif mode == 'sar':
+                eval_model = setup_sar(base_model)
             
             acc = evaluate_model(eval_model, clean_loader, 
                                description=f"Clean data - {mode.capitalize()}")

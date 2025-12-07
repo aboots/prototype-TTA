@@ -24,7 +24,11 @@ def _train_or_test(model, dataloader, optimizer=None, class_specific=True, use_l
     total_orth_loss = 0 
     total_comp_loss = 0 
     total_loss = 0 
-    for i, (image, label) in enumerate(dataloader):
+    
+    # Use tqdm for progress bar if available
+    iterator = tqdm(dataloader, desc="Eval", leave=False) if not is_train else dataloader
+    
+    for i, (image, label) in enumerate(iterator):
         input = image.cuda()
         target = label.cuda()
 

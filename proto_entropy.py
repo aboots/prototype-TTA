@@ -34,6 +34,7 @@ class ProtoEntropy(nn.Module):
         except AttributeError:
             return getattr(self.model, name)
 
+
     @torch.enable_grad()
     def forward_and_adapt(self, x):
         # 1. Forward Pass
@@ -43,19 +44,17 @@ class ProtoEntropy(nn.Module):
         with torch.no_grad():
             pred_class = logits.argmax(dim=1)
             
-            # --- Entropy Thresholding ---
+            # --- Logic for thresholding (Kept from your V2) ---
             if self.entropy_threshold is not None:
-                # Calculate Softmax Entropy of the logits (confidence measure)
-                # High entropy = uncertain prediction
+                num_classes = logits.shape[1]
+                # Fix: Ensure we don't multiply by 0 if threshold is 0, or handle None correctly
+                adaptive_threshold = self.entropy_threshold * torch.log(torch.tensor(num_classes, device=logits.device).float())
+                
                 probs = logits.softmax(dim=1)
                 entropy_vals = -(probs * torch.log(probs + 1e-6)).sum(dim=1)
+                reliable_mask = (entropy_vals < adaptive_threshold).float()
                 
-                # Create mask: 1 if reliable (entropy < threshold), 0 if unreliable
-                reliable_mask = (entropy_vals < self.entropy_threshold).float()
-                
-                # Check if we have ANY reliable samples
                 if reliable_mask.sum() == 0:
-                    # If no samples are reliable, skip update but return results
                     return logits, min_distances, similarities
             else:
                 reliable_mask = torch.ones(logits.size(0), device=logits.device)
@@ -65,63 +64,58 @@ class ProtoEntropy(nn.Module):
 
         # 3. Flatten/Max over sub-prototypes
         if similarities.dim() == 3:
-            sim_scores, _ = similarities.max(dim=2) # (B, P)
+            sim_scores, _ = similarities.max(dim=2) 
         else:
-            sim_scores = similarities # (B, P)
-        
-        # 4. Masking: Focus only on prototypes of the predicted class
+            sim_scores = similarities 
+
+        # 4. Masks
         target_mask = (proto_identities.unsqueeze(0) == pred_class.unsqueeze(1)).float()
-        
-        # Apply reliability mask (broadcasting to prototypes)
-        # We only want to optimize for reliable samples.
-        # reliable_mask shape: (B,) -> (B, 1) to match (B, P)
-        sample_weights = reliable_mask.unsqueeze(1)
-        
-        masked_sims = sim_scores * target_mask # (B, P)
-        
-        # 5. Bipolar Sharpening: Map [-1, 1] -> [0, 1]
-        # s = -1 => p = 0
-        # s =  0 => p = 0.5 (Max Entropy / Ambiguity)
-        # s = +1 => p = 1
-        # We assume sim_scores are strictly within [-1, 1].
-        # Sometimes numerical errors give slightly outside, so we clamp.
+        nontarget_mask = 1.0 - target_mask
+        sample_weights = reliable_mask.unsqueeze(1) 
+
+        # --- PART A: Target Loss (Same as V1) ---
+        masked_sims = sim_scores * target_mask 
         masked_sims = torch.clamp(masked_sims, min=-1.0, max=1.0)
         proto_probs = (masked_sims + 1.0) / 2.0
-        
-        # Clamp slightly to avoid log(0)
         eps = 1e-6
         proto_probs = torch.clamp(proto_probs, min=eps, max=1-eps)
 
-        # 6. Minimize Binary Entropy
-        # This forces proto_probs towards 0 OR 1.
-        # Consequently, it forces similarities towards -1 OR +1.
-        # It suppresses values near 0 (ambiguous noise).
         entropy = -(proto_probs * torch.log(proto_probs) + 
                    (1 - proto_probs) * torch.log(1 - proto_probs))
         
-        # Average over the target prototypes
-        # Note: For non-target prototypes (masked to 0), the similarity is 0.
-        # 0 similarity maps to p=0.5, which has MAXIMUM entropy.
-        # We do NOT want to minimize entropy for non-target classes (that would force them to -1 or 1).
-        # So we multiply by target_mask to only minimize entropy for the PREDICTED class.
+        target_loss_map = entropy * target_mask * sample_weights
         
-        masked_entropy = entropy * target_mask
+        # Normalize Target Loss by number of reliable SAMPLES
+        denom_target = sample_weights.sum() + 1e-8
+        loss_target = target_loss_map.sum() / denom_target
+
+        # --- PART B: Negative Margin Loss (The Fix) ---
+        neg_margin = 0.2 
+        neg_violation = F.relu(sim_scores - neg_margin)
         
-        # Weighted mean over target prototypes
-        # If reliable_mask is 0 for a sample, its contribution becomes 0.
-        weighted_loss = masked_entropy * sample_weights
+        # Apply masks
+        neg_loss_map = neg_violation * nontarget_mask * sample_weights
         
-        # Normalize by (number of active prototypes * number of reliable samples)
-        # Avoid division by zero
-        denom = (target_mask * sample_weights).sum() + 1e-8
-        loss = weighted_loss.sum() / denom
+        # NORMALIZATION FIX:
+        # We must divide by (Num_Samples * Num_Negative_Prototypes)
+        # Otherwise this term is 100x larger than loss_target
+        
+        # Count how many negative prototypes contribute to the loss
+        num_neg_prototypes = nontarget_mask.sum(dim=1).mean() # approx (P-1)
+        denom_neg = (sample_weights.sum() * num_neg_prototypes) + 1e-8
+        
+        loss_neg = neg_loss_map.sum() / denom_neg
+        
+        # --- Total Loss ---
+        # Now both losses are on the same scale (per-element average)
+        # You can add a weight to neg_loss if needed, e.g., 0.5 * loss_neg
+        loss = loss_target + loss_neg
 
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
         return logits, min_distances, similarities
-
 # Helper functions
 def collect_params(model):
     """Collect the affine scale + shift parameters from batch norms.
