@@ -70,7 +70,7 @@ def setup_tent(model):
     return tent_model
 
 
-def setup_proto_entropy(model):
+def setup_proto_entropy(model, use_importance=False, use_confidence=False):
     """Set up Prototype Entropy adaptation (without threshold)."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
@@ -79,7 +79,9 @@ def setup_proto_entropy(model):
         model,
         optimizer,
         steps=cfg.OPTIM.STEPS,
-        episodic=cfg.MODEL.EPISODIC
+        episodic=cfg.MODEL.EPISODIC,
+        use_prototype_importance=use_importance,
+        use_confidence_weighting=use_confidence
     )
     return proto_model
 
@@ -190,17 +192,17 @@ def parse_modes(mode_arg: str):
     Parse a comma-separated list of modes.
 
     If empty or contains 'all', all modes are enabled.
-    Valid individual modes: normal, tent, proto, proto_eata, loss, fisher, eata, sar, memo.
+    Valid individual modes: normal, tent, proto, proto_importance, proto_confidence, proto_importance_confidence, proto_eata, loss, fisher, eata, sar, memo.
     """
     if not mode_arg:
-        return {"normal", "tent", "proto", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
+        return {"normal", "tent", "proto", "proto_importance", "proto_confidence", "proto_importance_confidence", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
 
     raw = [m.strip().lower() for m in mode_arg.split(",") if m.strip()]
     modes = set(raw)
     if "all" in modes:
-        return {"normal", "tent", "proto", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
+        return {"normal", "tent", "proto", "proto_importance", "proto_confidence", "proto_importance_confidence", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
 
-    valid = {"normal", "tent", "proto", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
+    valid = {"normal", "tent", "proto", "proto_importance", "proto_confidence", "proto_importance_confidence", "proto_eata", "loss", "fisher", "eata", "sar", "memo"}
     selected = modes & valid
     return selected or valid
 
@@ -268,6 +270,9 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     run_normal = "normal" in selected_modes
     run_tent = "tent" in selected_modes
     run_proto = "proto" in selected_modes
+    run_proto_importance = "proto_importance" in selected_modes
+    run_proto_confidence = "proto_confidence" in selected_modes
+    run_proto_importance_confidence = "proto_importance_confidence" in selected_modes
     run_proto_eata = "proto_eata" in selected_modes
     run_loss = "loss" in selected_modes
     run_fisher = "fisher" in selected_modes
@@ -325,11 +330,74 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy (without threshold)
-        print("Setting up ProtoEntropy adaptation (without threshold)...")
-        proto_model = setup_proto_entropy(base_model)
+        print("Setting up ProtoEntropy adaptation (original)...")
+        proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=False)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
         results['ProtoEntropy'] = acc
+
+        # Clean up
+        del proto_model
+        torch.cuda.empty_cache()
+
+    # --- PROTO ENTROPY with IMPORTANCE WEIGHTING ---
+    if run_proto_importance:
+        print(f'\n>>> Loading model for PROTO ENTROPY (Importance-Weighted) inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        # Setup ProtoEntropy with importance weighting
+        print("Setting up ProtoEntropy with Prototype Importance Weighting...")
+        proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=False)
+
+        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Importance-Weighted) Inference")
+        results['ProtoEntropy-Importance'] = acc
+
+        # Clean up
+        del proto_model
+        torch.cuda.empty_cache()
+
+    # --- PROTO ENTROPY with CONFIDENCE WEIGHTING ---
+    if run_proto_confidence:
+        print(f'\n>>> Loading model for PROTO ENTROPY (Confidence-Weighted) inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        # Setup ProtoEntropy with confidence weighting
+        print("Setting up ProtoEntropy with Confidence Weighting...")
+        proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=True)
+
+        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Confidence-Weighted) Inference")
+        results['ProtoEntropy-Confidence'] = acc
+
+        # Clean up
+        del proto_model
+        torch.cuda.empty_cache()
+
+    # --- PROTO ENTROPY with IMPORTANCE+CONFIDENCE WEIGHTING ---
+    if run_proto_importance_confidence:
+        print(f'\n>>> Loading model for PROTO ENTROPY (Importance+Confidence-Weighted) inference from {model_path}')
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model not found at {model_path}")
+             
+        # Load clean model fresh from disk
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+
+        # Setup ProtoEntropy with both importance and confidence weighting
+        print("Setting up ProtoEntropy with Importance+Confidence Weighting...")
+        proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=True)
+
+        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Importance+Confidence-Weighted) Inference")
+        results['ProtoEntropy-Imp+Conf'] = acc
 
         # Clean up
         del proto_model
@@ -501,29 +569,35 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     print("-" * 50)
     
     if 'Normal' in results:
-        print(f"Normal            Accuracy: {results['Normal']*100:.2f}%")
+        print(f"Normal                   Accuracy: {results['Normal']*100:.2f}%")
     if 'Tent' in results:
-        print(f"Tent              Accuracy: {results['Tent']*100:.2f}%")
+        print(f"Tent                     Accuracy: {results['Tent']*100:.2f}%")
     if 'ProtoEntropy' in results:
-        print(f"ProtoEntropy      Accuracy: {results['ProtoEntropy']*100:.2f}%")
+        print(f"ProtoEntropy             Accuracy: {results['ProtoEntropy']*100:.2f}%")
+    if 'ProtoEntropy-Importance' in results:
+        print(f"ProtoEntropy-Importance  Accuracy: {results['ProtoEntropy-Importance']*100:.2f}%")
+    if 'ProtoEntropy-Confidence' in results:
+        print(f"ProtoEntropy-Confidence  Accuracy: {results['ProtoEntropy-Confidence']*100:.2f}%")
+    if 'ProtoEntropy-Imp+Conf' in results:
+        print(f"ProtoEntropy-Imp+Conf    Accuracy: {results['ProtoEntropy-Imp+Conf']*100:.2f}%")
     if 'ProtoEntropy+EATA' in results:
-        print(f"ProtoEntropy+EATA Accuracy: {results['ProtoEntropy+EATA']*100:.2f}%")
+        print(f"ProtoEntropy+EATA        Accuracy: {results['ProtoEntropy+EATA']*100:.2f}%")
     if 'LossAdapt' in results:
-        print(f"LossAdapt         Accuracy: {results['LossAdapt']*100:.2f}%")
+        print(f"LossAdapt                Accuracy: {results['LossAdapt']*100:.2f}%")
     if 'FisherProto' in results:
-        print(f"FisherProto       Accuracy: {results['FisherProto']*100:.2f}%")
+        print(f"FisherProto              Accuracy: {results['FisherProto']*100:.2f}%")
     if 'EATA' in results:
-        print(f"EATA              Accuracy: {results['EATA']*100:.2f}%")
+        print(f"EATA                     Accuracy: {results['EATA']*100:.2f}%")
     if 'SAR' in results:
-        print(f"SAR               Accuracy: {results['SAR']*100:.2f}%")
+        print(f"SAR                      Accuracy: {results['SAR']*100:.2f}%")
     if 'MEMO' in results:
-        print(f"MEMO              Accuracy: {results['MEMO']*100:.2f}%")
+        print(f"MEMO                     Accuracy: {results['MEMO']*100:.2f}%")
     
     print("="*50)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT (Normal, Tent, ProtoEntropy, ProtoEntropy+EATA, Loss, Fisher, EATA, SAR, MEMO)')
+    parser = argparse.ArgumentParser(description='Unified Inference for ProtoViT with multiple TTA methods')
     
     default_model_path = './saved_models/deit_small_patch16_224/exp1/14finetuned0.8609.pth'
     
@@ -540,10 +614,10 @@ if __name__ == '__main__':
         default='all',
         help=(
             'Inference mode(s): '
-            'use a comma-separated list of any of [normal, tent, proto, proto_eata, loss, fisher, eata, sar, memo], '
+            'use a comma-separated list of any of [normal, tent, proto, proto_importance, proto_confidence, proto_importance_confidence, proto_eata, loss, fisher, eata, sar, memo], '
             'or "all" (default) to run every mode.'
         ),
-    )
+    )  
     parser.add_argument(
         '--on-the-fly',
         action='store_true',

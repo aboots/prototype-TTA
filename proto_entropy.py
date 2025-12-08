@@ -5,12 +5,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ProtoEntropy(nn.Module):
-    def __init__(self, model, optimizer, steps=1, episodic=False):
+    def __init__(self, model, optimizer, steps=1, episodic=False, 
+                 alpha_target=1.0, alpha_separation=0.0, alpha_coherence=0.0,
+                 use_prototype_importance=False, use_confidence_weighting=False):
         super().__init__()
         self.model = model
         self.optimizer = optimizer
         self.steps = steps
         self.episodic = episodic
+        self.alpha_target = alpha_target
+        self.alpha_separation = alpha_separation
+        self.alpha_coherence = alpha_coherence
+        self.use_prototype_importance = use_prototype_importance
+        self.use_confidence_weighting = use_confidence_weighting
         self.model_state, self.optimizer_state = \
             copy_model_and_optimizer(self.model, self.optimizer)
 
@@ -45,33 +52,102 @@ class ProtoEntropy(nn.Module):
             proto_class_identity = self.model.prototype_class_identity.to(logits.device)
             proto_identities = proto_class_identity.argmax(dim=1)
 
-        # 3. Flatten/Max over sub-prototypes
+        # 3. Flatten/Max over sub-prototypes for main loss
         if similarities.dim() == 3:
             sim_scores, _ = similarities.max(dim=2)
         else:
             sim_scores = similarities
 
-        # 4. Masking: Focus only on prototypes of the predicted class
+        # 4. Masking: Target and Non-target prototypes
         target_mask = (proto_identities.unsqueeze(0) == pred_class.unsqueeze(1)).float()
-        masked_sims = sim_scores * target_mask
+        nontarget_mask = 1.0 - target_mask
 
-        # 5. Bipolar Sharpening: Map [-1, 1] -> [0, 1]
+        # ========== PART A: Target Entropy Loss ==========
+        masked_sims = sim_scores * target_mask
         masked_sims = torch.clamp(masked_sims, min=-1.0, max=1.0)
         proto_probs = (masked_sims + 1.0) / 2.0
 
-        # Clamp slightly to avoid log(0)
         eps = 1e-6
         proto_probs = torch.clamp(proto_probs, min=eps, max=1-eps)
 
-        # 6. Minimize Binary Entropy
+        # Minimize Binary Entropy for target prototypes
         entropy = -(proto_probs * torch.log(proto_probs) + 
                    (1 - proto_probs) * torch.log(1 - proto_probs))
+        
+        # --- NEW: Prototype Importance Weighting ---
+        if self.use_prototype_importance:
+            # Get the last_layer weights: [num_classes, num_prototypes]
+            # For each sample, get the weights for the predicted class
+            last_layer_weights = self.model.last_layer.weight  # [num_classes, num_prototypes]
+            
+            # Get weights for predicted classes: [batch_size, num_prototypes]
+            class_weights = last_layer_weights[pred_class]  # [B, P]
+            
+            # Normalize weights to [0, 1] range per sample (softmax-like but preserve relative importance)
+            # Use absolute values since negative weights also indicate importance
+            importance_weights = torch.abs(class_weights)
+            
+            # Normalize to sum to 1 for each sample (only for target prototypes)
+            importance_weights = importance_weights * target_mask
+            importance_weights = importance_weights / (importance_weights.sum(dim=1, keepdim=True) + 1e-8)
+            
+            # Weight the entropy by prototype importance
+            weighted_entropy = entropy * target_mask * importance_weights
+            loss_per_sample = weighted_entropy.sum(dim=1)  # [B]
+        else:
+            # Original: uniform weighting across all target prototypes
+            masked_entropy = entropy * target_mask
+            loss_per_sample = masked_entropy.sum(dim=1) / (target_mask.sum(dim=1) + 1e-8)  # [B]
+        
+        # --- NEW: Confidence Weighting ---
+        if self.use_confidence_weighting:
+            # Calculate prediction confidence (max probability)
+            with torch.no_grad():
+                probs = logits.softmax(dim=1)
+                confidence = probs.max(dim=1)[0]  # [B]
+            
+            # Weight the loss by confidence
+            # High confidence -> adapt more, Low confidence -> adapt less
+            loss_target = (loss_per_sample * confidence).mean()
+        else:
+            loss_target = loss_per_sample.mean()
 
-        # Average over the target prototypes
-        masked_entropy = entropy * target_mask
+        # ========== PART B: Separation Loss (Push non-target prototypes to -1) ==========
+        # For non-target prototypes, we want similarities to be close to -1 (dissimilar)
+        # Map to [0, 1] and push toward 0
+        nontarget_sims = sim_scores * nontarget_mask
+        nontarget_sims = torch.clamp(nontarget_sims, min=-1.0, max=1.0)
+        nontarget_probs = (nontarget_sims + 1.0) / 2.0  # Map [-1, 1] -> [0, 1]
+        nontarget_probs = torch.clamp(nontarget_probs, min=eps, max=1-eps)
+        
+        # Minimize the probability (push toward 0, meaning similarity toward -1)
+        # Using binary cross-entropy with target=0
+        separation_loss = -torch.log(1 - nontarget_probs) * nontarget_mask
+        loss_separation = separation_loss.sum(dim=1) / (nontarget_mask.sum(dim=1) + 1e-8)
+        loss_separation = loss_separation.mean()
 
-        loss = masked_entropy.sum(dim=1) / (target_mask.sum(dim=1) + 1e-8)
-        loss = loss.mean()
+        # ========== PART C: Sub-Prototype Coherence Loss ==========
+        loss_coherence = 0.0
+        if similarities.dim() == 3:
+            # similarities: [Batch, Prototypes, Sub-prototypes]
+            # For target prototypes, minimize variance across sub-prototypes
+            target_similarities = similarities * target_mask.unsqueeze(-1)  # [B, P, K]
+            
+            # Calculate variance across sub-prototypes (dim=2) for each prototype
+            # Only consider target prototypes
+            mean_sub = target_similarities.sum(dim=2, keepdim=True) / (similarities.shape[2] + 1e-8)
+            variance_sub = ((target_similarities - mean_sub) ** 2).sum(dim=2)  # [B, P]
+            
+            # Only count target prototypes
+            coherence_loss = variance_sub * target_mask
+            loss_coherence = coherence_loss.sum(dim=1) / (target_mask.sum(dim=1) + 1e-8)
+            loss_coherence = loss_coherence.mean()
+
+        # ========== Total Loss ==========
+        # Balance the three components using instance attributes
+        loss = self.alpha_target * loss_target + self.alpha_separation * loss_separation
+        if isinstance(loss_coherence, torch.Tensor):
+            loss = loss + self.alpha_coherence * loss_coherence
 
         loss.backward()
         self.optimizer.step()

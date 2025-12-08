@@ -94,12 +94,16 @@ def setup_tent(model):
     return tent.Tent(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
 
 
-def setup_proto_entropy(model):
+def setup_proto_entropy(model, alpha_target=1.0, alpha_separation=0.5, alpha_coherence=0.3,
+                       use_prototype_importance=False):
     """Set up ProtoEntropy adaptation (without threshold)."""
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
     optimizer = setup_optimizer(params)
-    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
+    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC,
+                                     alpha_target=alpha_target, alpha_separation=alpha_separation, 
+                                     alpha_coherence=alpha_coherence,
+                                     use_prototype_importance=use_prototype_importance)
 
 
 def setup_proto_entropy_eata(model, entropy_threshold=0.4):
