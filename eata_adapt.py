@@ -58,8 +58,9 @@ class EATA(nn.Module):
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:
             raise Exception("cannot reset without saved model/optimizer state")
-        load_model_and_optimizer(self.model, self.optimizer,
-                                 self.model_state, self.optimizer_state)
+        # Only reset model parameters, NOT optimizer state
+        # Preserves Adam momentum/variance for effective episodic updates
+        self.model.load_state_dict(self.model_state, strict=True)
         self.current_model_probs = None
 
     def reset_steps(self, new_steps):

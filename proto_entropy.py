@@ -31,8 +31,9 @@ class ProtoEntropy(nn.Module):
         return outputs, min_distances, similarities
 
     def reset(self):
-        load_model_and_optimizer(self.model, self.optimizer,
-                                 self.model_state, self.optimizer_state)
+        # Only reset model parameters, NOT optimizer state
+        # Preserves Adam momentum/variance for effective episodic updates
+        self.model.load_state_dict(self.model_state, strict=True)
     
     def __getattr__(self, name):
         try:
@@ -177,8 +178,9 @@ class ProtoEntropyEATA(nn.Module):
         return outputs, min_distances, similarities
 
     def reset(self):
-        load_model_and_optimizer(self.model, self.optimizer,
-                                 self.model_state, self.optimizer_state)
+        # Only reset model parameters, NOT optimizer state
+        # Preserves Adam momentum/variance for effective episodic updates
+        self.model.load_state_dict(self.model_state, strict=True)
     
     def __getattr__(self, name):
         try:
