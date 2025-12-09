@@ -7,33 +7,136 @@ import torch.nn.functional as F
 class ProtoEntropy(nn.Module):
     def __init__(self, model, optimizer, steps=1, episodic=False, 
                  alpha_target=1.0, alpha_separation=0.0, alpha_coherence=0.0,
-                 use_prototype_importance=False, use_confidence_weighting=False):
+                 use_prototype_importance=False, use_confidence_weighting=False,
+                 reset_mode=None, reset_frequency=10, 
+                 confidence_threshold=0.7, ema_alpha=0.999):
+        """
+        Args:
+            episodic: If True, uses 'episodic' reset_mode (backward compatibility)
+            reset_mode: 'episodic' (reset every sample), 'periodic' (reset every N batches),
+                       'confidence' (reset when confidence drops), 'ema' (exponential moving average),
+                       'none' (no reset), 'hybrid' (combine periodic + confidence)
+                       If None, infers from episodic flag: True='episodic', False='none'
+            reset_frequency: How often to reset in 'periodic' mode in BATCHES (e.g., 10 = every 10 batches)
+                           With batch_size=128, reset_frequency=10 means reset every 1280 samples
+            confidence_threshold: Minimum avg confidence before triggering reset in 'confidence' mode
+            ema_alpha: EMA decay factor for 'ema' mode (closer to 1 = slower adaptation)
+        """
         super().__init__()
         self.model = model
         self.optimizer = optimizer
         self.steps = steps
-        self.episodic = episodic
+        self.episodic = episodic  # Keep for backward compatibility
         self.alpha_target = alpha_target
         self.alpha_separation = alpha_separation
         self.alpha_coherence = alpha_coherence
         self.use_prototype_importance = use_prototype_importance
         self.use_confidence_weighting = use_confidence_weighting
+        
+        # New reset mechanism parameters
+        # If reset_mode not specified, infer from episodic flag for backward compatibility
+        if reset_mode is None:
+            self.reset_mode = 'episodic' if episodic else 'none'
+        else:
+            self.reset_mode = reset_mode
+        
+        self.reset_frequency = reset_frequency
+        self.confidence_threshold = confidence_threshold
+        self.ema_alpha = ema_alpha
+        
+        # State tracking
         self.model_state, self.optimizer_state = \
             copy_model_and_optimizer(self.model, self.optimizer)
+        self.batch_count = 0  # Track number of batches, not samples
+        self.sample_count = 0  # Keep for reference
+        self.confidence_history = []
+        self.ema_state = None
 
     def forward(self, x):
-        if self.episodic:
+        # Handle different reset strategies
+        should_reset = self._check_reset_condition(x)
+        if should_reset:
             self.reset()
 
         for _ in range(self.steps):
             outputs, min_distances, similarities = self.forward_and_adapt(x)
 
+        # Update tracking after adaptation
+        self._update_tracking(outputs)
+        
+        # EMA update if in EMA mode
+        if self.reset_mode == 'ema':
+            self._ema_update()
+
         return outputs, min_distances, similarities
 
+    def _check_reset_condition(self, x):
+        """Determine if we should reset based on the reset_mode.
+        
+        Note: reset_frequency is now in terms of BATCHES, not individual samples.
+        E.g., reset_frequency=10 means reset every 10 batches.
+        """
+        if self.reset_mode == 'episodic':
+            return True
+        elif self.reset_mode == 'none':
+            return False
+        elif self.reset_mode == 'periodic':
+            # Reset every N batches (e.g., every 10 batches)
+            return self.batch_count > 0 and self.batch_count % self.reset_frequency == 0
+        elif self.reset_mode == 'confidence':
+            if len(self.confidence_history) >= 5:  # Need history
+                avg_confidence = sum(self.confidence_history[-5:]) / 5
+                return avg_confidence < self.confidence_threshold
+            return False
+        elif self.reset_mode == 'hybrid':
+            # Reset periodically OR when confidence drops
+            periodic_reset = self.batch_count > 0 and self.batch_count % self.reset_frequency == 0
+            confidence_reset = False
+            if len(self.confidence_history) >= 5:
+                avg_confidence = sum(self.confidence_history[-5:]) / 5
+                confidence_reset = avg_confidence < self.confidence_threshold
+            return periodic_reset or confidence_reset
+        elif self.reset_mode == 'ema':
+            # EMA mode doesn't use hard resets
+            return False
+        else:
+            return False
+
+    def _update_tracking(self, logits):
+        """Update batch count, sample count, and confidence history."""
+        self.batch_count += 1  # Increment batch counter
+        self.sample_count += logits.shape[0]  # Track total samples for reference
+        
+        with torch.no_grad():
+            probs = logits.softmax(dim=1)
+            batch_confidence = probs.max(dim=1)[0].mean().item()
+            self.confidence_history.append(batch_confidence)
+            
+            # Keep only recent history
+            if len(self.confidence_history) > 50:
+                self.confidence_history = self.confidence_history[-50:]
+
+    def _ema_update(self):
+        """Apply exponential moving average to model parameters."""
+        if self.ema_state is None:
+            self.ema_state = deepcopy(self.model.state_dict())
+        else:
+            current_state = self.model.state_dict()
+            for key in self.ema_state:
+                if current_state[key].dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                    self.ema_state[key] = (self.ema_alpha * self.ema_state[key] + 
+                                          (1 - self.ema_alpha) * current_state[key])
+            self.model.load_state_dict(self.ema_state, strict=True)
+
     def reset(self):
+        """Reset model parameters to pretrained state."""
         # Only reset model parameters, NOT optimizer state
         # Preserves Adam momentum/variance for effective episodic updates
         self.model.load_state_dict(self.model_state, strict=True)
+        
+        # Reset EMA state if in EMA mode
+        if self.reset_mode == 'ema':
+            self.ema_state = None
     
     def __getattr__(self, name):
         try:

@@ -20,10 +20,18 @@ import eata_adapt
 import memo_adapt
 import sar_adapt
 from pathlib import Path
+import numpy as np
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Set seeds
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
+np.random.seed(0)
+random.seed(0)
 
 class Cfg:
     def __init__(self):
@@ -70,8 +78,18 @@ def setup_tent(model):
     return tent_model
 
 
-def setup_proto_entropy(model, use_importance=False, use_confidence=False):
-    """Set up Prototype Entropy adaptation (without threshold)."""
+def setup_proto_entropy(model, use_importance=False, use_confidence=False, 
+                        reset_mode=None, reset_frequency=10, 
+                        confidence_threshold=0.7, ema_alpha=0.999):
+    """Set up Prototype Entropy adaptation (without threshold).
+    
+    Args:
+        reset_mode: 'episodic', 'periodic', 'confidence', 'hybrid', 'ema', 'none'
+                   If None, infers from cfg.MODEL.EPISODIC
+        reset_frequency: How often to reset in 'periodic'/'hybrid' modes (in BATCHES, not samples)
+        confidence_threshold: Confidence threshold for 'confidence'/'hybrid' modes
+        ema_alpha: EMA decay for 'ema' mode
+    """
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
     optimizer = setup_optimizer(params)
@@ -81,7 +99,11 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False):
         steps=cfg.OPTIM.STEPS,
         episodic=cfg.MODEL.EPISODIC,
         use_prototype_importance=use_importance,
-        use_confidence_weighting=use_confidence
+        use_confidence_weighting=use_confidence,
+        reset_mode=reset_mode,
+        reset_frequency=reset_frequency,
+        confidence_threshold=confidence_threshold,
+        ema_alpha=ema_alpha
     )
     return proto_model
 
@@ -220,7 +242,9 @@ def evaluate_model(model, loader, description="Inference"):
     return accu
 
 
-def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', use_pre_generated=True, use_clean_fisher=False, proto_threshold=None):
+def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', 
+                         use_pre_generated=True, use_clean_fisher=False, proto_threshold=None,
+                         reset_mode=None, reset_frequency=10, confidence_threshold=0.7, ema_alpha=0.999):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -330,8 +354,10 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy (without threshold)
-        print("Setting up ProtoEntropy adaptation (original)...")
-        proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=False)
+        print(f"Setting up ProtoEntropy adaptation (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=False,
+                                         reset_mode=reset_mode, reset_frequency=reset_frequency,
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
         results['ProtoEntropy'] = acc
@@ -351,8 +377,10 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy with importance weighting
-        print("Setting up ProtoEntropy with Prototype Importance Weighting...")
-        proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=False)
+        print(f"Setting up ProtoEntropy with Prototype Importance (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=False,
+                                         reset_mode=reset_mode, reset_frequency=reset_frequency,
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Importance-Weighted) Inference")
         results['ProtoEntropy-Importance'] = acc
@@ -372,8 +400,10 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy with confidence weighting
-        print("Setting up ProtoEntropy with Confidence Weighting...")
-        proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=True)
+        print(f"Setting up ProtoEntropy with Confidence (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=True,
+                                         reset_mode=reset_mode, reset_frequency=reset_frequency,
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Confidence-Weighted) Inference")
         results['ProtoEntropy-Confidence'] = acc
@@ -393,8 +423,10 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy with both importance and confidence weighting
-        print("Setting up ProtoEntropy with Importance+Confidence Weighting...")
-        proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=True)
+        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=True,
+                                         reset_mode=reset_mode, reset_frequency=reset_frequency,
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
 
         acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Importance+Confidence-Weighted) Inference")
         results['ProtoEntropy-Imp+Conf'] = acc
@@ -639,6 +671,38 @@ if __name__ == '__main__':
         help='Entropy threshold for ProtoEntropy+EATA adaptation (default: 0.4). Samples with higher entropy are ignored.'
     )
     
+    parser.add_argument(
+        '--reset-mode',
+        type=str,
+        default=None,
+        choices=['episodic', 'periodic', 'confidence', 'hybrid', 'ema', 'none', None],
+        help='Reset strategy for ProtoEntropy: episodic (every sample), periodic (every N samples), '
+             'confidence (when conf drops), hybrid (periodic+confidence), ema (smooth updates), '
+             'none (no resets). Default: inferred from --episodic flag.'
+    )
+    
+    parser.add_argument(
+        '--reset-frequency',
+        type=int,
+        default=10,
+        help='How often to reset in periodic/hybrid modes in BATCHES (default: 10 batches). '
+             'With batch_size=128, this means reset every 1280 samples.'
+    )
+    
+    parser.add_argument(
+        '--confidence-threshold',
+        type=float,
+        default=0.7,
+        help='Confidence threshold for confidence/hybrid reset modes (default: 0.7)'
+    )
+    
+    parser.add_argument(
+        '--ema-alpha',
+        type=float,
+        default=0.999,
+        help='EMA decay factor for ema mode (default: 0.999, closer to 1 = slower adaptation)'
+    )
+    
     args = parser.parse_args()
     
     # Handle no-corruption flag
@@ -652,4 +716,6 @@ if __name__ == '__main__':
     # Determine whether to use pre-generated images (default: True, unless --on-the-fly is set)
     use_pre_generated = not args.on_the_fly
     
-    run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, use_pre_generated, args.use_clean_fisher, args.proto_threshold)
+    run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, 
+                         use_pre_generated, args.use_clean_fisher, args.proto_threshold,
+                         args.reset_mode, args.reset_frequency, args.confidence_threshold, args.ema_alpha)
