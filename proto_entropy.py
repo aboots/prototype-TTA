@@ -9,7 +9,8 @@ class ProtoEntropy(nn.Module):
                  alpha_target=1.0, alpha_separation=0.0, alpha_coherence=0.0,
                  use_prototype_importance=False, use_confidence_weighting=False,
                  reset_mode=None, reset_frequency=10, 
-                 confidence_threshold=0.7, ema_alpha=0.999):
+                 confidence_threshold=0.7, ema_alpha=0.999,
+                 use_geometric_filter=False, geo_filter_threshold=0.3):
         """
         Args:
             episodic: If True, uses 'episodic' reset_mode (backward compatibility)
@@ -21,6 +22,9 @@ class ProtoEntropy(nn.Module):
                            With batch_size=128, reset_frequency=10 means reset every 1280 samples
             confidence_threshold: Minimum avg confidence before triggering reset in 'confidence' mode
             ema_alpha: EMA decay factor for 'ema' mode (closer to 1 = slower adaptation)
+            use_geometric_filter: If True, filter unreliable samples using geometric similarity to prototypes
+            geo_filter_threshold: Minimum similarity to ANY prototype to be considered reliable (default: 0.3)
+                                 Higher = more strict filtering, Lower = accept more samples
         """
         super().__init__()
         self.model = model
@@ -32,6 +36,10 @@ class ProtoEntropy(nn.Module):
         self.alpha_coherence = alpha_coherence
         self.use_prototype_importance = use_prototype_importance
         self.use_confidence_weighting = use_confidence_weighting
+        
+        # Geometric filtering parameters
+        self.use_geometric_filter = use_geometric_filter
+        self.geo_filter_threshold = geo_filter_threshold
         
         # New reset mechanism parameters
         # If reset_mode not specified, infer from episodic flag for backward compatibility
@@ -51,6 +59,15 @@ class ProtoEntropy(nn.Module):
         self.sample_count = 0  # Keep for reference
         self.confidence_history = []
         self.ema_state = None
+        
+        # Statistics tracking for geometric filtering
+        self.geo_filter_stats = {
+            'total_samples': 0,
+            'filtered_samples': 0,
+            'min_similarities': [],  # Track min similarity per batch
+            'max_similarities': [],  # Track max similarity per batch
+            'avg_similarities': []   # Track avg similarity per batch
+        }
 
     def forward(self, x):
         # Handle different reset strategies
@@ -138,6 +155,36 @@ class ProtoEntropy(nn.Module):
         if self.reset_mode == 'ema':
             self.ema_state = None
     
+    def get_geo_filter_stats(self):
+        """Get geometric filtering statistics."""
+        stats = self.geo_filter_stats.copy()
+        if stats['total_samples'] > 0:
+            stats['filter_rate'] = stats['filtered_samples'] / stats['total_samples']
+            if stats['min_similarities']:
+                stats['overall_min_sim'] = min(stats['min_similarities'])
+                stats['overall_max_sim'] = max(stats['max_similarities'])
+                stats['overall_avg_sim'] = sum(stats['avg_similarities']) / len(stats['avg_similarities'])
+            else:
+                stats['overall_min_sim'] = None
+                stats['overall_max_sim'] = None
+                stats['overall_avg_sim'] = None
+        else:
+            stats['filter_rate'] = 0.0
+            stats['overall_min_sim'] = None
+            stats['overall_max_sim'] = None
+            stats['overall_avg_sim'] = None
+        return stats
+    
+    def reset_geo_filter_stats(self):
+        """Reset geometric filtering statistics."""
+        self.geo_filter_stats = {
+            'total_samples': 0,
+            'filtered_samples': 0,
+            'min_similarities': [],
+            'max_similarities': [],
+            'avg_similarities': []
+        }
+    
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)
@@ -162,9 +209,46 @@ class ProtoEntropy(nn.Module):
         else:
             sim_scores = similarities
 
+        # ========== Geometric Filtering: Filter unreliable samples ==========
+        if self.use_geometric_filter:
+            with torch.no_grad():
+                # Use sub-prototypes for more robust filtering
+                if similarities.dim() == 3:
+                    # [B, P, K] - Use average across top sub-prototypes per prototype
+                    # This is more robust than just the max (handles outlier sub-prototypes)
+                    top_k = min(3, similarities.shape[2])  # Top 3 sub-protos (or all if < 3)
+                    top_sims, _ = torch.topk(similarities, k=top_k, dim=2)  # [B, P, top_k]
+                    avg_top_sims = top_sims.mean(dim=2)  # [B, P] - average of top sub-protos
+                    max_sim_per_sample = avg_top_sims.max(dim=1)[0]  # [B]
+                else:
+                    # No sub-prototypes, use the max similarity directly
+                    max_sim_per_sample = sim_scores.max(dim=1)[0]  # [B]
+                
+                # Track statistics
+                batch_size = max_sim_per_sample.shape[0]
+                self.geo_filter_stats['total_samples'] += batch_size
+                num_filtered = (max_sim_per_sample <= self.geo_filter_threshold).sum().item()
+                self.geo_filter_stats['filtered_samples'] += num_filtered
+                self.geo_filter_stats['min_similarities'].append(max_sim_per_sample.min().item())
+                self.geo_filter_stats['max_similarities'].append(max_sim_per_sample.max().item())
+                self.geo_filter_stats['avg_similarities'].append(max_sim_per_sample.mean().item())
+                
+                # Samples with low similarity to ALL prototypes are unreliable (noisy/corrupted)
+                reliable_mask = (max_sim_per_sample > self.geo_filter_threshold).float()  # [B]
+                
+                # If no reliable samples, skip adaptation
+                if reliable_mask.sum() == 0:
+                    return logits, min_distances, similarities
+        else:
+            # All samples are considered reliable
+            reliable_mask = torch.ones(logits.shape[0], device=logits.device)
+
         # 4. Masking: Target and Non-target prototypes
         target_mask = (proto_identities.unsqueeze(0) == pred_class.unsqueeze(1)).float()
         nontarget_mask = 1.0 - target_mask
+        
+        # Apply sample reliability mask (broadcast to prototype dimension)
+        sample_weights = reliable_mask.unsqueeze(1)  # [B, 1]
 
         # ========== PART A: Target Entropy Loss ==========
         masked_sims = sim_scores * target_mask
@@ -178,7 +262,7 @@ class ProtoEntropy(nn.Module):
         entropy = -(proto_probs * torch.log(proto_probs) + 
                    (1 - proto_probs) * torch.log(1 - proto_probs))
         
-        # --- NEW: Prototype Importance Weighting ---
+        # --- Prototype Importance Weighting ---
         if self.use_prototype_importance:
             # Get the last_layer weights: [num_classes, num_prototypes]
             # For each sample, get the weights for the predicted class
@@ -195,26 +279,27 @@ class ProtoEntropy(nn.Module):
             importance_weights = importance_weights * target_mask
             importance_weights = importance_weights / (importance_weights.sum(dim=1, keepdim=True) + 1e-8)
             
-            # Weight the entropy by prototype importance
-            weighted_entropy = entropy * target_mask * importance_weights
+            # Weight the entropy by prototype importance AND sample reliability
+            weighted_entropy = entropy * target_mask * importance_weights * sample_weights
             loss_per_sample = weighted_entropy.sum(dim=1)  # [B]
         else:
-            # Original: uniform weighting across all target prototypes
-            masked_entropy = entropy * target_mask
+            # Original: uniform weighting across all target prototypes, filtered by reliability
+            masked_entropy = entropy * target_mask * sample_weights
             loss_per_sample = masked_entropy.sum(dim=1) / (target_mask.sum(dim=1) + 1e-8)  # [B]
         
-        # --- NEW: Confidence Weighting ---
+        # --- Confidence Weighting ---
         if self.use_confidence_weighting:
             # Calculate prediction confidence (max probability)
             with torch.no_grad():
                 probs = logits.softmax(dim=1)
                 confidence = probs.max(dim=1)[0]  # [B]
             
-            # Weight the loss by confidence
-            # High confidence -> adapt more, Low confidence -> adapt less
-            loss_target = (loss_per_sample * confidence).mean()
+            # Weight the loss by confidence AND reliability
+            # Only count reliable samples in the mean
+            loss_target = (loss_per_sample * confidence * reliable_mask).sum() / (reliable_mask.sum() + 1e-8)
         else:
-            loss_target = loss_per_sample.mean()
+            # Only count reliable samples in the mean
+            loss_target = (loss_per_sample * reliable_mask).sum() / (reliable_mask.sum() + 1e-8)
 
         # ========== PART B: Separation Loss (Push non-target prototypes to -1) ==========
         # For non-target prototypes, we want similarities to be close to -1 (dissimilar)
@@ -225,10 +310,10 @@ class ProtoEntropy(nn.Module):
         nontarget_probs = torch.clamp(nontarget_probs, min=eps, max=1-eps)
         
         # Minimize the probability (push toward 0, meaning similarity toward -1)
-        # Using binary cross-entropy with target=0
-        separation_loss = -torch.log(1 - nontarget_probs) * nontarget_mask
+        # Using binary cross-entropy with target=0, filtered by sample reliability
+        separation_loss = -torch.log(1 - nontarget_probs) * nontarget_mask * sample_weights
         loss_separation = separation_loss.sum(dim=1) / (nontarget_mask.sum(dim=1) + 1e-8)
-        loss_separation = loss_separation.mean()
+        loss_separation = (loss_separation * reliable_mask).sum() / (reliable_mask.sum() + 1e-8)
 
         # ========== PART C: Sub-Prototype Coherence Loss ==========
         loss_coherence = 0.0
@@ -242,10 +327,10 @@ class ProtoEntropy(nn.Module):
             mean_sub = target_similarities.sum(dim=2, keepdim=True) / (similarities.shape[2] + 1e-8)
             variance_sub = ((target_similarities - mean_sub) ** 2).sum(dim=2)  # [B, P]
             
-            # Only count target prototypes
-            coherence_loss = variance_sub * target_mask
+            # Only count target prototypes, filtered by sample reliability
+            coherence_loss = variance_sub * target_mask * sample_weights
             loss_coherence = coherence_loss.sum(dim=1) / (target_mask.sum(dim=1) + 1e-8)
-            loss_coherence = loss_coherence.mean()
+            loss_coherence = (loss_coherence * reliable_mask).sum() / (reliable_mask.sum() + 1e-8)
 
         # ========== Total Loss ==========
         # Balance the three components using instance attributes

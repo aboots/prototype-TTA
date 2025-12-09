@@ -22,6 +22,10 @@ import sar_adapt
 from pathlib import Path
 import numpy as np
 import random
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -80,7 +84,8 @@ def setup_tent(model):
 
 def setup_proto_entropy(model, use_importance=False, use_confidence=False, 
                         reset_mode=None, reset_frequency=10, 
-                        confidence_threshold=0.7, ema_alpha=0.999):
+                        confidence_threshold=0.7, ema_alpha=0.999,
+                        use_geometric_filter=False, geo_filter_threshold=0.3):
     """Set up Prototype Entropy adaptation (without threshold).
     
     Args:
@@ -89,6 +94,8 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         reset_frequency: How often to reset in 'periodic'/'hybrid' modes (in BATCHES, not samples)
         confidence_threshold: Confidence threshold for 'confidence'/'hybrid' modes
         ema_alpha: EMA decay for 'ema' mode
+        use_geometric_filter: Use geometric similarity to filter unreliable samples
+        geo_filter_threshold: Minimum similarity to ANY prototype to be considered reliable
     """
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
@@ -103,7 +110,9 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         reset_mode=reset_mode,
         reset_frequency=reset_frequency,
         confidence_threshold=confidence_threshold,
-        ema_alpha=ema_alpha
+        ema_alpha=ema_alpha,
+        use_geometric_filter=use_geometric_filter,
+        geo_filter_threshold=geo_filter_threshold
     )
     return proto_model
 
@@ -209,6 +218,89 @@ def setup_memo(model, lr=0.00025, batch_size=64, steps=1):
     return memo_model
 
 
+def create_performance_plots(results_dict, output_dir, corruption_info=""):
+    """Create bar plots showing per-batch performance for each method.
+    
+    Args:
+        results_dict: Dict mapping method_name -> {'accuracy': float, 'batch_accuracies': list}
+        output_dir: Directory to save plots
+        corruption_info: String describing corruption (for title)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Extract data
+    methods = []
+    batch_accs_list = []
+    final_accs = []
+    
+    for method_name, data in results_dict.items():
+        if 'batch_accuracies' in data and data['batch_accuracies'] is not None:
+            methods.append(method_name)
+            batch_accs_list.append(data['batch_accuracies'])
+            final_accs.append(data['accuracy'] * 100)
+    
+    if not methods:
+        print("No per-batch data to plot.")
+        return
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Prepare data for grouped bar plot
+    num_batches = max(len(batch_accs) for batch_accs in batch_accs_list)
+    x = np.arange(num_batches)
+    width = 0.8 / len(methods)
+    
+    # Plot bars for each method
+    colors = plt.cm.tab10(np.linspace(0, 1, len(methods)))
+    for i, (method, batch_accs, final_acc, color) in enumerate(zip(methods, batch_accs_list, final_accs, colors)):
+        # Pad with NaN if needed
+        padded_accs = batch_accs + [np.nan] * (num_batches - len(batch_accs))
+        offset = (i - len(methods)/2 + 0.5) * width
+        ax.bar(x + offset, [acc * 100 if not np.isnan(acc) else 0 for acc in padded_accs], 
+               width, label=f'{method} (Final: {final_acc:.2f}%)', 
+               color=color, alpha=0.7)
+    
+    ax.set_xlabel('Batch Index', fontsize=12)
+    ax.set_ylabel('Accuracy (%)', fontsize=12)
+    title = f'Per-Batch Performance Comparison'
+    if corruption_info:
+        title += f'\n{corruption_info}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_xticks(x[::max(1, num_batches//20)])  # Show every Nth batch label
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'per_batch_performance.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved per-batch performance plot to: {plot_path}")
+    
+    # Also create a line plot for easier trend visualization
+    fig, ax = plt.subplots(figsize=(14, 8))
+    for method, batch_accs, final_acc, color in zip(methods, batch_accs_list, final_accs, colors):
+        batch_indices = np.arange(len(batch_accs))
+        ax.plot(batch_indices, [acc * 100 for acc in batch_accs], 
+               label=f'{method} (Final: {final_acc:.2f}%)', 
+               color=color, linewidth=2, marker='o', markersize=3, alpha=0.7)
+    
+    ax.set_xlabel('Batch Index', fontsize=12)
+    ax.set_ylabel('Accuracy (%)', fontsize=12)
+    title = f'Per-Batch Performance Trends'
+    if corruption_info:
+        title += f'\n{corruption_info}'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'per_batch_trends.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved per-batch trends plot to: {plot_path}")
+
+
 def parse_modes(mode_arg: str):
     """
     Parse a comma-separated list of modes.
@@ -228,23 +320,66 @@ def parse_modes(mode_arg: str):
     selected = modes & valid
     return selected or valid
 
-def evaluate_model(model, loader, description="Inference"):
-    """Helper to run evaluation loop."""
+def evaluate_model(model, loader, description="Inference", track_per_batch=False):
+    """Helper to run evaluation loop.
+    
+    Args:
+        track_per_batch: If True, returns per-batch accuracies for visualization
+    """
     print(f'\nStarting {description}...')
     class_specific = True 
-    accu, test_loss_dict = tnt.test(model=model, dataloader=loader,
-                                    class_specific=class_specific, log=print, 
-                                    clst_k=k, sum_cls=sum_cls)
-    print('-' * 20)
-    print(f'{description} Complete.')
-    print(f'Final Accuracy: {accu*100:.2f}%')
-    print('-' * 20)
-    return accu
+    
+    if track_per_batch:
+        # Custom evaluation with per-batch tracking
+        model.eval()
+        batch_accuracies = []
+        n_examples = 0
+        n_correct = 0
+        
+        with torch.no_grad():
+            for batch_idx, (images, labels) in enumerate(loader):
+                images = images.cuda()
+                labels = labels.cuda()
+                
+                # Forward pass
+                outputs = model(images)
+                
+                # Get predictions - handle both tuple and single output
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]  # First element is logits
+                else:
+                    logits = outputs
+                
+                _, predicted = logits.max(1)
+                batch_correct = predicted.eq(labels).sum().item()
+                batch_size = labels.size(0)
+                batch_acc = batch_correct / batch_size
+                batch_accuracies.append(batch_acc)
+                
+                n_correct += batch_correct
+                n_examples += batch_size
+        
+        accu = n_correct / n_examples
+        print('-' * 20)
+        print(f'{description} Complete.')
+        print(f'Final Accuracy: {accu*100:.2f}%')
+        print('-' * 20)
+        return accu, batch_accuracies
+    else:
+        accu, test_loss_dict = tnt.test(model=model, dataloader=loader,
+                                        class_specific=class_specific, log=print, 
+                                        clst_k=k, sum_cls=sum_cls)
+        print('-' * 20)
+        print(f'{description} Complete.')
+        print(f'Final Accuracy: {accu*100:.2f}%')
+        print('-' * 20)
+        return accu
 
 
 def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', 
                          use_pre_generated=True, use_clean_fisher=False, proto_threshold=None,
-                         reset_mode=None, reset_frequency=10, confidence_threshold=0.7, ema_alpha=0.999):
+                         reset_mode=None, reset_frequency=10, confidence_threshold=0.7, ema_alpha=0.999,
+                         use_geometric_filter=False, geo_filter_threshold=0.3, output_dir='./plots'):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -288,6 +423,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     print(f'Test set size: {len(test_loader.dataset)}')
     
     results = {}
+    results_with_batches = {}  # Store per-batch data for plotting
 
     # Determine which modes to run (supports comma-separated list).
     selected_modes = parse_modes(mode)
@@ -315,8 +451,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
         base_model.eval()
 
-        acc = evaluate_model(base_model, test_loader, description="Normal Inference (No Adaptation)")
+        acc, batch_accs = evaluate_model(base_model, test_loader, 
+                                         description="Normal Inference (No Adaptation)",
+                                         track_per_batch=True)
         results['Normal'] = acc
+        results_with_batches['Normal'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
         
         # Clean up to free memory
         del base_model
@@ -336,8 +478,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up Tent adaptation...")
         tent_model = setup_tent(base_model)
         
-        acc = evaluate_model(tent_model, test_loader, description="Tent Adaptation Inference")
+        acc, batch_accs = evaluate_model(tent_model, test_loader, 
+                                         description="Tent Adaptation Inference",
+                                         track_per_batch=True)
         results['Tent'] = acc
+        results_with_batches['Tent'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
         
         # Clean up
         del tent_model
@@ -354,13 +502,29 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy (without threshold)
-        print(f"Setting up ProtoEntropy adaptation (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
+        print(f"Setting up ProtoEntropy (reset_mode={reset_mode}, freq={reset_frequency} batches{filter_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=False,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
-                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
+                                         use_geometric_filter=use_geometric_filter, 
+                                         geo_filter_threshold=geo_filter_threshold)
 
-        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy Adaptation Inference")
+        if hasattr(proto_model, 'reset_geo_filter_stats'):
+            proto_model.reset_geo_filter_stats()
+        
+        acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                         description="ProtoEntropy Adaptation Inference",
+                                         track_per_batch=True)
         results['ProtoEntropy'] = acc
+        results_with_batches['ProtoEntropy'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
+        
+        if use_geometric_filter and hasattr(proto_model, 'get_geo_filter_stats'):
+            geo_stats = proto_model.get_geo_filter_stats()
+            results_with_batches['ProtoEntropy']['geo_stats'] = geo_stats
 
         # Clean up
         del proto_model
@@ -377,13 +541,29 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy with importance weighting
-        print(f"Setting up ProtoEntropy with Prototype Importance (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
+        print(f"Setting up ProtoEntropy+Importance (reset_mode={reset_mode}, freq={reset_frequency}{filter_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=False,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
-                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
+                                         use_geometric_filter=use_geometric_filter, 
+                                         geo_filter_threshold=geo_filter_threshold)
 
-        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Importance-Weighted) Inference")
+        if hasattr(proto_model, 'reset_geo_filter_stats'):
+            proto_model.reset_geo_filter_stats()
+        
+        acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                         description="ProtoEntropy (Importance-Weighted) Inference",
+                                         track_per_batch=True)
         results['ProtoEntropy-Importance'] = acc
+        results_with_batches['ProtoEntropy-Importance'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
+        
+        if use_geometric_filter and hasattr(proto_model, 'get_geo_filter_stats'):
+            geo_stats = proto_model.get_geo_filter_stats()
+            results_with_batches['ProtoEntropy-Importance']['geo_stats'] = geo_stats
 
         # Clean up
         del proto_model
@@ -400,13 +580,29 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy with confidence weighting
-        print(f"Setting up ProtoEntropy with Confidence (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
+        print(f"Setting up ProtoEntropy+Confidence (reset_mode={reset_mode}, freq={reset_frequency}{filter_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=True,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
-                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
+                                         use_geometric_filter=use_geometric_filter, 
+                                         geo_filter_threshold=geo_filter_threshold)
 
-        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Confidence-Weighted) Inference")
+        if hasattr(proto_model, 'reset_geo_filter_stats'):
+            proto_model.reset_geo_filter_stats()
+        
+        acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                         description="ProtoEntropy (Confidence-Weighted) Inference",
+                                         track_per_batch=True)
         results['ProtoEntropy-Confidence'] = acc
+        results_with_batches['ProtoEntropy-Confidence'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
+        
+        if use_geometric_filter and hasattr(proto_model, 'get_geo_filter_stats'):
+            geo_stats = proto_model.get_geo_filter_stats()
+            results_with_batches['ProtoEntropy-Confidence']['geo_stats'] = geo_stats
 
         # Clean up
         del proto_model
@@ -423,13 +619,40 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
 
         # Setup ProtoEntropy with both importance and confidence weighting
-        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency} batches)...")
+        filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
+        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency}{filter_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=True,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
-                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha)
+                                         confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
+                                         use_geometric_filter=use_geometric_filter, 
+                                         geo_filter_threshold=geo_filter_threshold)
 
-        acc = evaluate_model(proto_model, test_loader, description="ProtoEntropy (Importance+Confidence-Weighted) Inference")
+        # Reset stats before evaluation
+        if hasattr(proto_model, 'reset_geo_filter_stats'):
+            proto_model.reset_geo_filter_stats()
+        
+        acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                         description="ProtoEntropy (Importance+Confidence-Weighted) Inference",
+                                         track_per_batch=True)
         results['ProtoEntropy-Imp+Conf'] = acc
+        results_with_batches['ProtoEntropy-Imp+Conf'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
+        
+        # Get geometric filter statistics
+        if use_geometric_filter and hasattr(proto_model, 'get_geo_filter_stats'):
+            geo_stats = proto_model.get_geo_filter_stats()
+            results_with_batches['ProtoEntropy-Imp+Conf']['geo_stats'] = geo_stats
+            print(f"\n--- Geometric Filter Statistics (ProtoEntropy-Imp+Conf) ---")
+            print(f"Total samples processed: {geo_stats['total_samples']}")
+            print(f"Samples filtered: {geo_stats['filtered_samples']} ({geo_stats['filter_rate']*100:.2f}%)")
+            if geo_stats['overall_min_sim'] is not None:
+                print(f"Minimum similarity across all batches: {geo_stats['overall_min_sim']:.4f}")
+                print(f"Maximum similarity across all batches: {geo_stats['overall_max_sim']:.4f}")
+                print(f"Average similarity across all batches: {geo_stats['overall_avg_sim']:.4f}")
+                print(f"Threshold used: {geo_filter_threshold}")
+            print("-" * 50)
 
         # Clean up
         del proto_model
@@ -449,8 +672,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print(f"Setting up ProtoEntropy+EATA adaptation (threshold={proto_threshold})...")
         proto_eata_model = setup_proto_entropy_eata(base_model, entropy_threshold=proto_threshold)
 
-        acc = evaluate_model(proto_eata_model, test_loader, description="ProtoEntropy+EATA Adaptation Inference")
+        acc, batch_accs = evaluate_model(proto_eata_model, test_loader, 
+                                         description="ProtoEntropy+EATA Adaptation Inference",
+                                         track_per_batch=True)
         results['ProtoEntropy+EATA'] = acc
+        results_with_batches['ProtoEntropy+EATA'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
 
         # Clean up
         del proto_eata_model
@@ -468,8 +697,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up Loss Adapt adaptation...")
         loss_model = setup_loss_adapt(base_model)
         
-        acc = evaluate_model(loss_model, test_loader, description="Loss Adapt Inference")
+        acc, batch_accs = evaluate_model(loss_model, test_loader, 
+                                         description="Loss Adapt Inference",
+                                         track_per_batch=True)
         results['LossAdapt'] = acc
+        results_with_batches['LossAdapt'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
         
         del loss_model
         torch.cuda.empty_cache()
@@ -488,8 +723,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up Fisher-guided Proto adaptation...")
         fisher_model = setup_fisher_proto(base_model)
 
-        acc = evaluate_model(fisher_model, test_loader, description="FisherProto Adaptation Inference")
+        acc, batch_accs = evaluate_model(fisher_model, test_loader, 
+                                         description="FisherProto Adaptation Inference",
+                                         track_per_batch=True)
         results['FisherProto'] = acc
+        results_with_batches['FisherProto'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
 
         # Clean up
         del fisher_model
@@ -537,8 +778,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up EATA adaptation...")
         eata_model = setup_eata(base_model, fishers)
 
-        acc = evaluate_model(eata_model, test_loader, description="EATA Adaptation Inference")
+        acc, batch_accs = evaluate_model(eata_model, test_loader, 
+                                         description="EATA Adaptation Inference",
+                                         track_per_batch=True)
         results['EATA'] = acc
+        results_with_batches['EATA'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
 
         # Clean up
         del eata_model
@@ -558,8 +805,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up SAR adaptation...")
         sar_model = setup_sar(base_model)
 
-        acc = evaluate_model(sar_model, test_loader, description="SAR Adaptation Inference")
+        acc, batch_accs = evaluate_model(sar_model, test_loader, 
+                                         description="SAR Adaptation Inference",
+                                         track_per_batch=True)
         results['SAR'] = acc
+        results_with_batches['SAR'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
 
         # Clean up
         del sar_model
@@ -584,13 +837,46 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             test_dataset, batch_size=1, shuffle=False,
             num_workers=4, pin_memory=False)
 
-        acc = evaluate_model(memo_model, memo_loader, description="MEMO Adaptation Inference")
+        acc, batch_accs = evaluate_model(memo_model, memo_loader, 
+                                         description="MEMO Adaptation Inference",
+                                         track_per_batch=True)
         results['MEMO'] = acc
+        results_with_batches['MEMO'] = {
+            'accuracy': acc,
+            'batch_accuracies': batch_accs
+        }
 
         # Clean up
         del memo_model
         torch.cuda.empty_cache()
 
+    # --- CREATE PLOTS ---
+    if results_with_batches:
+        corruption_str = f"{corruption}_sev{severity}" if corruption else "clean"
+        plot_subdir = os.path.join(output_dir, corruption_str)
+        os.makedirs(plot_subdir, exist_ok=True)
+        
+        # Create per-batch performance plots
+        create_performance_plots(results_with_batches, plot_subdir, 
+                                corruption_info=f"Corruption: {corruption if corruption else 'None'}, Severity: {severity if corruption else 'N/A'}")
+        
+        # Print geometric filter statistics for all methods that used it
+        print("\n" + "="*50)
+        print("GEOMETRIC FILTER STATISTICS")
+        print("="*50)
+        for method_name, data in results_with_batches.items():
+            if 'geo_stats' in data:
+                geo_stats = data['geo_stats']
+                print(f"\n{method_name}:")
+                print(f"  Total samples: {geo_stats['total_samples']}")
+                print(f"  Filtered: {geo_stats['filtered_samples']} ({geo_stats['filter_rate']*100:.2f}%)")
+                if geo_stats['overall_min_sim'] is not None:
+                    print(f"  Min similarity: {geo_stats['overall_min_sim']:.4f}")
+                    print(f"  Max similarity: {geo_stats['overall_max_sim']:.4f}")
+                    print(f"  Avg similarity: {geo_stats['overall_avg_sim']:.4f}")
+                    print(f"  Threshold: {geo_filter_threshold}")
+        print("="*50)
+    
     # --- FINAL SUMMARY ---
     print("\n" + "="*50)
     print("FINAL RESULTS SUMMARY")
@@ -703,6 +989,28 @@ if __name__ == '__main__':
         help='EMA decay factor for ema mode (default: 0.999, closer to 1 = slower adaptation)'
     )
     
+    parser.add_argument(
+        '--use-geometric-filter',
+        action='store_true',
+        default=False,
+        help='Enable geometric filtering: filter out samples with low similarity to ALL prototypes (noisy/unreliable samples)'
+    )
+    
+    parser.add_argument(
+        '--geo-filter-threshold',
+        type=float,
+        default=0.3,
+        help='Geometric filter threshold: minimum max similarity to ANY prototype to be considered reliable (default: 0.3). '
+             'Higher = more strict filtering, lower = accept more samples. Range: [-1, 1]'
+    )
+    
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='./plots',
+        help='Directory to save performance plots (default: ./plots)'
+    )
+    
     args = parser.parse_args()
     
     # Handle no-corruption flag
@@ -718,4 +1026,5 @@ if __name__ == '__main__':
     
     run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, 
                          use_pre_generated, args.use_clean_fisher, args.proto_threshold,
-                         args.reset_mode, args.reset_frequency, args.confidence_threshold, args.ema_alpha)
+                         args.reset_mode, args.reset_frequency, args.confidence_threshold, args.ema_alpha,
+                         args.use_geometric_filter, args.geo_filter_threshold, args.output_dir)
