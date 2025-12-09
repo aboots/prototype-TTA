@@ -85,7 +85,8 @@ def setup_tent(model):
 def setup_proto_entropy(model, use_importance=False, use_confidence=False, 
                         reset_mode=None, reset_frequency=10, 
                         confidence_threshold=0.7, ema_alpha=0.999,
-                        use_geometric_filter=False, geo_filter_threshold=0.3):
+                        use_geometric_filter=False, geo_filter_threshold=0.3,
+                        consensus_strategy='max', consensus_ratio=0.5):
     """Set up Prototype Entropy adaptation (without threshold).
     
     Args:
@@ -96,6 +97,8 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         ema_alpha: EMA decay for 'ema' mode
         use_geometric_filter: Use geometric similarity to filter unreliable samples
         geo_filter_threshold: Minimum similarity to ANY prototype to be considered reliable
+        consensus_strategy: How to aggregate sub-prototypes ('max', 'mean', 'median', 'top_k_mean', 'weighted_mean')
+        consensus_ratio: For 'top_k_mean', fraction of sub-prototypes to use
     """
     model = proto_entropy.configure_model(model)
     params, param_names = proto_entropy.collect_params(model)
@@ -112,7 +115,9 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         confidence_threshold=confidence_threshold,
         ema_alpha=ema_alpha,
         use_geometric_filter=use_geometric_filter,
-        geo_filter_threshold=geo_filter_threshold
+        geo_filter_threshold=geo_filter_threshold,
+        consensus_strategy=consensus_strategy,
+        consensus_ratio=consensus_ratio
     )
     return proto_model
 
@@ -379,7 +384,8 @@ def evaluate_model(model, loader, description="Inference", track_per_batch=False
 def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, mode='all', 
                          use_pre_generated=True, use_clean_fisher=False, proto_threshold=None,
                          reset_mode=None, reset_frequency=10, confidence_threshold=0.7, ema_alpha=0.999,
-                         use_geometric_filter=False, geo_filter_threshold=0.3, output_dir='./plots'):
+                         use_geometric_filter=False, geo_filter_threshold=0.3, output_dir='./plots',
+                         consensus_strategy='max', consensus_ratio=0.5):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -503,12 +509,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
 
         # Setup ProtoEntropy (without threshold)
         filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
-        print(f"Setting up ProtoEntropy (reset_mode={reset_mode}, freq={reset_frequency} batches{filter_info})...")
+        consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
+        print(f"Setting up ProtoEntropy (reset_mode={reset_mode}, freq={reset_frequency} batches{filter_info}{consensus_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=False,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
                                          use_geometric_filter=use_geometric_filter, 
-                                         geo_filter_threshold=geo_filter_threshold)
+                                         geo_filter_threshold=geo_filter_threshold,
+                                         consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio)
 
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
@@ -542,12 +550,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
 
         # Setup ProtoEntropy with importance weighting
         filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
-        print(f"Setting up ProtoEntropy+Importance (reset_mode={reset_mode}, freq={reset_frequency}{filter_info})...")
+        consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
+        print(f"Setting up ProtoEntropy+Importance (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=False,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
                                          use_geometric_filter=use_geometric_filter, 
-                                         geo_filter_threshold=geo_filter_threshold)
+                                         geo_filter_threshold=geo_filter_threshold,
+                                         consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio)
 
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
@@ -581,12 +591,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
 
         # Setup ProtoEntropy with confidence weighting
         filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
-        print(f"Setting up ProtoEntropy+Confidence (reset_mode={reset_mode}, freq={reset_frequency}{filter_info})...")
+        consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
+        print(f"Setting up ProtoEntropy+Confidence (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=True,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
                                          use_geometric_filter=use_geometric_filter, 
-                                         geo_filter_threshold=geo_filter_threshold)
+                                         geo_filter_threshold=geo_filter_threshold,
+                                         consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio)
 
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
@@ -620,12 +632,14 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
 
         # Setup ProtoEntropy with both importance and confidence weighting
         filter_info = f", geo_filter={use_geometric_filter}" if use_geometric_filter else ""
-        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency}{filter_info})...")
+        consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
+        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=True,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
                                          use_geometric_filter=use_geometric_filter, 
-                                         geo_filter_threshold=geo_filter_threshold)
+                                         geo_filter_threshold=geo_filter_threshold,
+                                         consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio)
 
         # Reset stats before evaluation
         if hasattr(proto_model, 'reset_geo_filter_stats'):
@@ -1011,6 +1025,23 @@ if __name__ == '__main__':
         help='Directory to save performance plots (default: ./plots)'
     )
     
+    parser.add_argument(
+        '--consensus-strategy',
+        type=str,
+        default='max',
+        choices=['max', 'mean', 'median', 'top_k_mean', 'weighted_mean'],
+        help='Strategy for aggregating sub-prototypes: '
+             'max (best sub-proto, default), mean (all must agree), median (robust), '
+             'top_k_mean (soft consensus), weighted_mean (similarity-weighted)'
+    )
+    
+    parser.add_argument(
+        '--consensus-ratio',
+        type=float,
+        default=0.5,
+        help='For top_k_mean consensus: fraction of sub-prototypes to use (default: 0.5 = top 50%%)'
+    )
+    
     args = parser.parse_args()
     
     # Handle no-corruption flag
@@ -1027,4 +1058,5 @@ if __name__ == '__main__':
     run_unified_inference(args.model, args.gpuid, corruption, args.severity, args.mode, 
                          use_pre_generated, args.use_clean_fisher, args.proto_threshold,
                          args.reset_mode, args.reset_frequency, args.confidence_threshold, args.ema_alpha,
-                         args.use_geometric_filter, args.geo_filter_threshold, args.output_dir)
+                         args.use_geometric_filter, args.geo_filter_threshold, args.output_dir,
+                         args.consensus_strategy, args.consensus_ratio)

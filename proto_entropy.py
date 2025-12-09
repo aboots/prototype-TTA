@@ -10,7 +10,8 @@ class ProtoEntropy(nn.Module):
                  use_prototype_importance=False, use_confidence_weighting=False,
                  reset_mode=None, reset_frequency=10, 
                  confidence_threshold=0.7, ema_alpha=0.999,
-                 use_geometric_filter=False, geo_filter_threshold=0.3):
+                 use_geometric_filter=False, geo_filter_threshold=0.3,
+                 consensus_strategy='max', consensus_ratio=0.5):
         """
         Args:
             episodic: If True, uses 'episodic' reset_mode (backward compatibility)
@@ -25,6 +26,13 @@ class ProtoEntropy(nn.Module):
             use_geometric_filter: If True, filter unreliable samples using geometric similarity to prototypes
             geo_filter_threshold: Minimum similarity to ANY prototype to be considered reliable (default: 0.3)
                                  Higher = more strict filtering, Lower = accept more samples
+            consensus_strategy: How to aggregate sub-prototype similarities for filtering/adaptation:
+                               'max' - use best sub-prototype (original, can be fooled by outliers)
+                               'mean' - use average across sub-prototypes (requires consensus)
+                               'median' - use median across sub-prototypes (robust to outliers)
+                               'top_k_mean' - average of top-K sub-prototypes (soft consensus)
+                               'weighted_mean' - similarity-weighted mean (high sims matter more)
+            consensus_ratio: For 'top_k_mean', what fraction of sub-prototypes to use (default: 0.5 = top 50%)
         """
         super().__init__()
         self.model = model
@@ -40,6 +48,10 @@ class ProtoEntropy(nn.Module):
         # Geometric filtering parameters
         self.use_geometric_filter = use_geometric_filter
         self.geo_filter_threshold = geo_filter_threshold
+        
+        # Consensus strategy parameters
+        self.consensus_strategy = consensus_strategy
+        self.consensus_ratio = consensus_ratio
         
         # New reset mechanism parameters
         # If reset_mode not specified, infer from episodic flag for backward compatibility
@@ -144,6 +156,50 @@ class ProtoEntropy(nn.Module):
                     self.ema_state[key] = (self.ema_alpha * self.ema_state[key] + 
                                           (1 - self.ema_alpha) * current_state[key])
             self.model.load_state_dict(self.ema_state, strict=True)
+    
+    def compute_consensus_similarity(self, similarities):
+        """Compute consensus-based similarity across sub-prototypes.
+        
+        Args:
+            similarities: [Batch, Prototypes, Sub-prototypes] or [Batch, Prototypes]
+        
+        Returns:
+            aggregated_sims: [Batch, Prototypes] - consensus similarity per prototype
+        """
+        if similarities.dim() == 2:
+            # No sub-prototypes, return as-is
+            return similarities
+        
+        # similarities: [B, P, K]
+        if self.consensus_strategy == 'max':
+            # Original: take best sub-prototype
+            aggregated_sims, _ = similarities.max(dim=2)
+        
+        elif self.consensus_strategy == 'mean':
+            # Consensus: all sub-prototypes must agree (average)
+            aggregated_sims = similarities.mean(dim=2)
+        
+        elif self.consensus_strategy == 'median':
+            # Robust consensus: median across sub-prototypes
+            aggregated_sims = similarities.median(dim=2)[0]
+        
+        elif self.consensus_strategy == 'top_k_mean':
+            # Soft consensus: average of top-K sub-prototypes
+            K = similarities.shape[2]
+            top_k = max(1, int(K * self.consensus_ratio))
+            top_sims, _ = torch.topk(similarities, k=top_k, dim=2)
+            aggregated_sims = top_sims.mean(dim=2)
+        
+        elif self.consensus_strategy == 'weighted_mean':
+            # Weighted by similarity: high similarities contribute more
+            # Use softmax as weights
+            weights = F.softmax(similarities * 10, dim=2)  # Temperature=0.1
+            aggregated_sims = (similarities * weights).sum(dim=2)
+        
+        else:
+            raise ValueError(f"Unknown consensus_strategy: {self.consensus_strategy}")
+        
+        return aggregated_sims
 
     def reset(self):
         """Reset model parameters to pretrained state."""
@@ -203,26 +259,16 @@ class ProtoEntropy(nn.Module):
             proto_class_identity = self.model.prototype_class_identity.to(logits.device)
             proto_identities = proto_class_identity.argmax(dim=1)
 
-        # 3. Flatten/Max over sub-prototypes for main loss
-        if similarities.dim() == 3:
-            sim_scores, _ = similarities.max(dim=2)
-        else:
-            sim_scores = similarities
+        # 3. Aggregate sub-prototypes using consensus strategy
+        sim_scores = self.compute_consensus_similarity(similarities)
 
         # ========== Geometric Filtering: Filter unreliable samples ==========
         if self.use_geometric_filter:
             with torch.no_grad():
-                # Use sub-prototypes for more robust filtering
-                if similarities.dim() == 3:
-                    # [B, P, K] - Use average across top sub-prototypes per prototype
-                    # This is more robust than just the max (handles outlier sub-prototypes)
-                    top_k = min(3, similarities.shape[2])  # Top 3 sub-protos (or all if < 3)
-                    top_sims, _ = torch.topk(similarities, k=top_k, dim=2)  # [B, P, top_k]
-                    avg_top_sims = top_sims.mean(dim=2)  # [B, P] - average of top sub-protos
-                    max_sim_per_sample = avg_top_sims.max(dim=1)[0]  # [B]
-                else:
-                    # No sub-prototypes, use the max similarity directly
-                    max_sim_per_sample = sim_scores.max(dim=1)[0]  # [B]
+                # Use consensus similarity (already computed) for filtering
+                # sim_scores is [B, P] after consensus aggregation
+                # Find the best prototype match per sample
+                max_sim_per_sample = sim_scores.max(dim=1)[0]  # [B]
                 
                 # Track statistics
                 batch_size = max_sim_per_sample.shape[0]
