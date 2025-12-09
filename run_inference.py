@@ -26,6 +26,9 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 from collections import defaultdict
+import local_analysis
+from log import create_logger
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -236,6 +239,118 @@ def setup_memo(model, lr=0.00025, batch_size=64, steps=1):
     return memo_model
 
 
+def extract_underlying_model(adapted_model):
+    """Extract the underlying PPNet model from adaptation wrappers.
+    
+    Args:
+        adapted_model: Can be a wrapped model (Tent, EATA, ProtoEntropy, etc.) or raw model
+    
+    Returns:
+        The underlying PPNet model
+    """
+    # If it's a wrapped model, access the .model attribute
+    if hasattr(adapted_model, 'model'):
+        return adapted_model.model
+    # Otherwise, assume it's already the raw model
+    return adapted_model
+
+
+def run_interpretability_analysis(model_or_wrapper, method_name, image_paths, 
+                                  model_path, test_image_dir, output_dir, 
+                                  corruption_str, log=None):
+    """Run local analysis for interpretability comparison.
+    
+    Args:
+        model_or_wrapper: The model (may be wrapped in adaptation method)
+                         IMPORTANT: The model should be in its adapted state (after running on test set)
+        method_name: Name of the method (e.g., 'Normal', 'EATA', 'ProtoEntropy-Imp+Conf')
+        image_paths: List of image paths relative to test_image_dir
+        model_path: Path to the saved model (to find prototype images)
+        test_image_dir: Base directory for test images (should be clean test_dir)
+        output_dir: Base output directory for analysis results
+        corruption_str: String describing corruption (for subdirectory)
+        log: Logger function (optional)
+    """
+    if log is None:
+        log = print
+    
+    # Extract underlying model - this preserves the adapted parameters
+    # The wrapper's .model attribute points to the same object, so adaptations are preserved
+    ppnet = extract_underlying_model(model_or_wrapper)
+    
+    # For adaptation methods that use train mode (like Tent, ProtoEntropy), 
+    # we need to keep them in train mode to preserve adapted parameters
+    # But local_analysis will set eval mode, which is fine for most cases
+    # However, for LayerNorm/BatchNorm adaptation, we might want to preserve train mode
+    # For now, let's use eval mode for analysis (this is what local_analysis does anyway)
+    ppnet.eval()  # Ensure eval mode for analysis
+    
+    # Determine prototype image directory from model path
+    # Typically: saved_models/arch/exp/model.pth -> saved_models/arch/exp/img_name/
+    model_dir = os.path.dirname(model_path)
+    # Try common prototype image directory names
+    possible_img_dirs = [
+        os.path.join(model_dir, 'img'),
+        os.path.join(model_dir, 'prototype_imgs'),
+        os.path.join(model_dir, 'prototype-img'),
+    ]
+    load_img_dir = None
+    for img_dir in possible_img_dirs:
+        if os.path.exists(img_dir):
+            load_img_dir = img_dir
+            break
+    
+    if load_img_dir is None:
+        log(f"WARNING: Could not find prototype image directory for {method_name}. Skipping interpretability analysis.")
+        log(f"  Searched in: {possible_img_dirs}")
+        return
+    
+    # Extract epoch number from model filename
+    model_filename = os.path.basename(model_path)
+    epoch_match = re.search(r'\d+', model_filename)
+    start_epoch_number = int(epoch_match.group(0)) if epoch_match else 0
+    
+    # Create save directory for this method
+    save_analysis_path = os.path.join(output_dir, 'interpretability', corruption_str, method_name)
+    os.makedirs(save_analysis_path, exist_ok=True)
+    
+    # Create logger for this analysis
+    log_file = os.path.join(save_analysis_path, f'{method_name}_analysis.log')
+    analysis_log, logclose = create_logger(log_filename=log_file)
+    
+    log(f"\n>>> Running interpretability analysis for {method_name}")
+    log(f"  Analysis output: {save_analysis_path}")
+    log(f"  Prototype images: {load_img_dir}")
+    
+    # Run local analysis for each image
+    for img_path in image_paths:
+        try:
+            analysis_log(f'\n{"="*60}')
+            analysis_log(f'Analyzing image: {img_path}')
+            analysis_log(f'Method: {method_name}')
+            analysis_log(f'{"="*60}')
+            
+            local_analysis.local_analysis(
+                imgs=img_path,
+                ppnet=ppnet,
+                save_analysis_path=save_analysis_path,
+                test_image_dir=test_image_dir,
+                start_epoch_number=start_epoch_number,
+                load_img_dir=load_img_dir,
+                log=analysis_log,
+                prototype_layer_stride=1
+            )
+            log(f"  ✓ Analyzed: {img_path}")
+        except Exception as e:
+            log(f"  ✗ Error analyzing {img_path}: {e}")
+            analysis_log(f"ERROR analyzing {img_path}: {e}")
+            import traceback
+            analysis_log(traceback.format_exc())
+    
+    logclose()
+    log(f"  Analysis complete for {method_name}")
+
+
 def create_performance_plots(results_dict, output_dir, corruption_info=""):
     """Create bar plots showing per-batch performance for each method.
     
@@ -401,7 +516,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                          consensus_strategy='max', consensus_ratio=0.5,
                          adaptation_mode='layernorm_only',
                          use_ensemble_entropy=False,
-                         use_source_stats=False, alpha_source_kl=0.0, num_source_samples=500):
+                         use_source_stats=False, alpha_source_kl=0.0, num_source_samples=500,
+                         interpretability_images=None, interpretability_num_images=3):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -409,6 +525,21 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
+    
+    # Prepare interpretability analysis
+    corruption_str = f"{corruption}_sev{severity}" if corruption else "clean"
+    interpretability_enabled = interpretability_images is not None or interpretability_num_images > 0
+    
+    # Determine which images to analyze for interpretability
+    image_paths_to_analyze = []
+    if interpretability_enabled:
+        if interpretability_images:
+            # Use provided image paths
+            image_paths_to_analyze = interpretability_images if isinstance(interpretability_images, list) else [interpretability_images]
+        else:
+            # Select random images from test dataset
+            # We'll do this after loading the dataset
+            pass
 
     # Data loading
     if corruption:
@@ -443,6 +574,33 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         num_workers=8, pin_memory=False)
 
     print(f'Test set size: {len(test_loader.dataset)}')
+    
+    # Select random images for interpretability if needed
+    # Always use clean test_dir for interpretability (images will be analyzed in adapted model state)
+    if interpretability_enabled and not image_paths_to_analyze:
+        # Load clean test dataset to get image paths
+        transform_clean = transforms.Compose([
+            transforms.Resize(size=(img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+        clean_test_dataset = datasets.ImageFolder(test_dir, transform_clean)
+        
+        # Get random samples from clean test dataset
+        dataset_size = len(clean_test_dataset)
+        num_to_select = min(interpretability_num_images, dataset_size)
+        selected_indices = np.random.choice(dataset_size, size=num_to_select, replace=False)
+        
+        # Get image paths from clean dataset
+        for idx in selected_indices:
+            img_path, _ = clean_test_dataset.samples[idx]
+            # Convert to relative path from test_dir
+            rel_path = os.path.relpath(img_path, test_dir)
+            image_paths_to_analyze.append(rel_path)
+        
+        print(f'Selected {len(image_paths_to_analyze)} images for interpretability analysis (from clean test set):')
+        for img_path in image_paths_to_analyze:
+            print(f'  - {img_path}')
     
     results = {}
     results_with_batches = {}  # Store per-batch data for plotting
@@ -525,6 +683,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             'batch_accuracies': batch_accs
         }
         
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                base_model, 'Normal', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
+        
         # Clean up to free memory
         del base_model
         torch.cuda.empty_cache()
@@ -551,6 +716,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
+        
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                tent_model, 'Tent', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
         
         # Clean up
         del tent_model
@@ -599,6 +771,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             geo_stats = proto_model.get_geo_filter_stats()
             results_with_batches['ProtoEntropy']['geo_stats'] = geo_stats
 
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                proto_model, 'ProtoEntropy', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
+
         # Clean up
         del proto_model
         torch.cuda.empty_cache()
@@ -646,6 +825,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             geo_stats = proto_model.get_geo_filter_stats()
             results_with_batches['ProtoEntropy-Importance']['geo_stats'] = geo_stats
 
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                proto_model, 'ProtoEntropy-Importance', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
+
         # Clean up
         del proto_model
         torch.cuda.empty_cache()
@@ -692,6 +878,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         if use_geometric_filter and hasattr(proto_model, 'get_geo_filter_stats'):
             geo_stats = proto_model.get_geo_filter_stats()
             results_with_batches['ProtoEntropy-Confidence']['geo_stats'] = geo_stats
+
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                proto_model, 'ProtoEntropy-Confidence', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
 
         # Clean up
         del proto_model
@@ -750,6 +943,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                 print(f"Average similarity across all batches: {geo_stats['overall_avg_sim']:.4f}")
                 print(f"Threshold used: {geo_filter_threshold}")
             print("-" * 50)
+
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                proto_model, 'ProtoEntropy-Imp+Conf', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
 
         # Clean up
         del proto_model
@@ -883,6 +1083,13 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
+
+        # Run interpretability analysis
+        if interpretability_enabled:
+            run_interpretability_analysis(
+                eata_model, 'EATA', image_paths_to_analyze,
+                model_path, test_dir, output_dir, corruption_str
+            )
 
         # Clean up
         del eata_model
@@ -1175,6 +1382,24 @@ if __name__ == '__main__':
         help='Number of clean source samples to use for computing prototype statistics (default: 500)'
     )
     
+    parser.add_argument(
+        '--interpretability-images',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Image paths (relative to test_dir) for interpretability analysis. '
+             'Example: "class1/img1.jpg" "class2/img2.jpg". '
+             'If not provided and --interpretability-num-images > 0, random images will be selected.'
+    )
+    
+    parser.add_argument(
+        '--interpretability-num-images',
+        type=int,
+        default=0,
+        help='Number of random images to select for interpretability analysis (default: 0 = disabled). '
+             'Ignored if --interpretability-images is provided.'
+    )
+    
     args = parser.parse_args()
     
     # Handle no-corruption flag
@@ -1194,4 +1419,5 @@ if __name__ == '__main__':
                          args.use_geometric_filter, args.geo_filter_threshold, args.output_dir,
                          args.consensus_strategy, args.consensus_ratio, args.adaptation_mode,
                          args.use_ensemble_entropy, args.use_source_stats, args.alpha_source_kl, 
-                         args.num_source_samples)
+                         args.num_source_samples,
+                         args.interpretability_images, args.interpretability_num_images)
