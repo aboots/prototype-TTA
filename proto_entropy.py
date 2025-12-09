@@ -495,41 +495,129 @@ class ProtoEntropyEATA(nn.Module):
 
         return logits, min_distances, similarities
 # Helper functions
-def collect_params(model):
-    """Collect the affine scale + shift parameters from batch norms.
-
-    Walk the model's modules and collect all batch normalization parameters.
-    Return the parameters and their names.
-
-    Note: other choices of parameterization are possible!
+def collect_params(model, adaptation_mode='layernorm_only'):
+    """Collect parameters for test-time adaptation.
+    
+    Args:
+        model: The ProtoViT model
+        adaptation_mode: What to adapt during TTA
+            'layernorm_only' - Only LayerNorm/BatchNorm (default, safest)
+            'layernorm_proto' - LayerNorms + Prototype vectors
+            'layernorm_proto_patch' - LayerNorms + Prototypes + Patch select
+            'layernorm_proto_last' - LayerNorms + Prototypes + Last layer
+            'layernorm_attn_bias' - LayerNorms + Attention biases in backbone
+            'layernorm_last_block' - LayerNorms + Last transformer block
+            'full_proto' - Prototypes + Patch select + Last layer (no backbone)
+            'all_adaptive' - Everything except frozen backbone features
+    
+    Returns:
+        params: List of parameters to optimize
+        names: List of parameter names
     """
     params = []
     names = []
-    for nm, m in model.named_modules():
-        if isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
-            for np, p in m.named_parameters():
-                if np in ['weight', 'bias']:  # weight is scale, bias is shift
-                    params.append(p)
-                    names.append(f"{nm}.{np}")
+    
+    # Always include LayerNorm/BatchNorm if mode includes 'layernorm'
+    if 'layernorm' in adaptation_mode:
+        for nm, m in model.named_modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
+                for np, p in m.named_parameters():
+                    if np in ['weight', 'bias']:
+                        params.append(p)
+                        names.append(f"{nm}.{np}")
+    
+    # Add prototype vectors
+    if 'proto' in adaptation_mode or adaptation_mode == 'all_adaptive':
+        if hasattr(model, 'prototype_vectors'):
+            params.append(model.prototype_vectors)
+            names.append('prototype_vectors')
+    
+    # Add patch selection parameters
+    if 'patch' in adaptation_mode or adaptation_mode == 'all_adaptive':
+        if hasattr(model, 'patch_select'):
+            params.append(model.patch_select)
+            names.append('patch_select')
+    
+    # Add last layer (classification head)
+    if 'last' in adaptation_mode or adaptation_mode == 'all_adaptive':
+        if hasattr(model, 'last_layer'):
+            for np, p in model.last_layer.named_parameters():
+                params.append(p)
+                names.append(f"last_layer.{np}")
+    
+    # Add attention biases from backbone
+    if 'attn_bias' in adaptation_mode:
+        for nm, m in model.named_modules():
+            if 'attn' in nm.lower() or 'attention' in nm.lower():
+                for np, p in m.named_parameters():
+                    if 'bias' in np:  # Only biases, not full weights
+                        params.append(p)
+                        names.append(f"{nm}.{np}")
+    
+    # Add last transformer block (more aggressive)
+    if 'last_block' in adaptation_mode:
+        for nm, p in model.named_parameters():
+            # Assuming blocks are named like 'features.blocks.11.*' (last block)
+            if 'blocks.11' in nm or 'blocks.10' in nm:  # Last 2 blocks
+                params.append(p)
+                names.append(nm)
+    
     return params, names
 
 
-def configure_model(model):
-    """Configure model for use with ProtoEntropy adaptation."""
+def configure_model(model, adaptation_mode='layernorm_only'):
+    """Configure model for use with ProtoEntropy adaptation.
+    
+    Args:
+        adaptation_mode: What parameters to enable for adaptation (same as collect_params)
+    """
     # train mode, because ProtoEntropy optimizes the model to minimize entropy
     model.train()
     # disable grad, to (re-)enable only what ProtoEntropy updates
     model.requires_grad_(False)
-    # configure norm for ProtoEntropy updates: enable grad + force batch statistics
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.requires_grad_(True)
-            # force use of batch stats in train and eval modes
-            m.track_running_stats = False
-            m.running_mean = None
-            m.running_var = None
-        elif isinstance(m, nn.LayerNorm):
-            m.requires_grad_(True)
+    
+    # Configure LayerNorms/BatchNorms
+    if 'layernorm' in adaptation_mode:
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.requires_grad_(True)
+                # force use of batch stats in train and eval modes
+                m.track_running_stats = False
+                m.running_mean = None
+                m.running_var = None
+            elif isinstance(m, nn.LayerNorm):
+                m.requires_grad_(True)
+    
+    # Enable prototype vectors
+    if 'proto' in adaptation_mode or adaptation_mode == 'all_adaptive':
+        if hasattr(model, 'prototype_vectors'):
+            model.prototype_vectors.requires_grad = True
+    
+    # Enable patch selection
+    if 'patch' in adaptation_mode or adaptation_mode == 'all_adaptive':
+        if hasattr(model, 'patch_select'):
+            model.patch_select.requires_grad = True
+    
+    # Enable last layer
+    if 'last' in adaptation_mode or adaptation_mode == 'all_adaptive':
+        if hasattr(model, 'last_layer'):
+            for p in model.last_layer.parameters():
+                p.requires_grad = True
+    
+    # Enable attention biases
+    if 'attn_bias' in adaptation_mode:
+        for nm, m in model.named_modules():
+            if 'attn' in nm.lower() or 'attention' in nm.lower():
+                for np, p in m.named_parameters():
+                    if 'bias' in np:
+                        p.requires_grad = True
+    
+    # Enable last transformer blocks
+    if 'last_block' in adaptation_mode:
+        for nm, p in model.named_parameters():
+            if 'blocks.11' in nm or 'blocks.10' in nm:
+                p.requires_grad = True
+    
     return model
 
 
