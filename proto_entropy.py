@@ -11,7 +11,8 @@ class ProtoEntropy(nn.Module):
                  reset_mode=None, reset_frequency=10, 
                  confidence_threshold=0.7, ema_alpha=0.999,
                  use_geometric_filter=False, geo_filter_threshold=0.3,
-                 consensus_strategy='max', consensus_ratio=0.5):
+                 consensus_strategy='max', consensus_ratio=0.5,
+                 use_ensemble_entropy=False):
         """
         Args:
             episodic: If True, uses 'episodic' reset_mode (backward compatibility)
@@ -33,6 +34,8 @@ class ProtoEntropy(nn.Module):
                                'top_k_mean' - average of top-K sub-prototypes (soft consensus)
                                'weighted_mean' - similarity-weighted mean (high sims matter more)
             consensus_ratio: For 'top_k_mean', what fraction of sub-prototypes to use (default: 0.5 = top 50%)
+            use_ensemble_entropy: If True, treat sub-prototypes as ensemble: compute entropy per sub-proto, then average
+                                 If False, aggregate sub-protos first, then compute entropy (default)
         """
         super().__init__()
         self.model = model
@@ -52,6 +55,9 @@ class ProtoEntropy(nn.Module):
         # Consensus strategy parameters
         self.consensus_strategy = consensus_strategy
         self.consensus_ratio = consensus_ratio
+        
+        # Ensemble entropy parameter
+        self.use_ensemble_entropy = use_ensemble_entropy
         
         # New reset mechanism parameters
         # If reset_mode not specified, infer from episodic flag for backward compatibility
@@ -297,16 +303,41 @@ class ProtoEntropy(nn.Module):
         sample_weights = reliable_mask.unsqueeze(1)  # [B, 1]
 
         # ========== PART A: Target Entropy Loss ==========
-        masked_sims = sim_scores * target_mask
-        masked_sims = torch.clamp(masked_sims, min=-1.0, max=1.0)
-        proto_probs = (masked_sims + 1.0) / 2.0
-
         eps = 1e-6
-        proto_probs = torch.clamp(proto_probs, min=eps, max=1-eps)
-
-        # Minimize Binary Entropy for target prototypes
-        entropy = -(proto_probs * torch.log(proto_probs) + 
-                   (1 - proto_probs) * torch.log(1 - proto_probs))
+        
+        # --- NEW: Ensemble Entropy (Voting across sub-prototypes) ---
+        if self.use_ensemble_entropy and similarities.dim() == 3:
+            # Treat each sub-prototype as a weak classifier
+            # Compute entropy for each sub-prototype, then average
+            # similarities: [B, P, K]
+            
+            # Apply target mask at sub-prototype level: [B, P, K]
+            target_mask_3d = target_mask.unsqueeze(-1)  # [B, P, 1]
+            masked_sims_3d = similarities * target_mask_3d  # [B, P, K]
+            masked_sims_3d = torch.clamp(masked_sims_3d, min=-1.0, max=1.0)
+            
+            # Convert each sub-prototype similarity to probability
+            proto_probs_3d = (masked_sims_3d + 1.0) / 2.0  # [B, P, K]
+            proto_probs_3d = torch.clamp(proto_probs_3d, min=eps, max=1-eps)
+            
+            # Compute entropy for EACH sub-prototype independently
+            entropy_per_subproto = -(proto_probs_3d * torch.log(proto_probs_3d) + 
+                                     (1 - proto_probs_3d) * torch.log(1 - proto_probs_3d))  # [B, P, K]
+            
+            # Average entropies across sub-prototypes (ensemble)
+            # This prevents a single overconfident sub-prototype from dominating
+            entropy = entropy_per_subproto.mean(dim=2)  # [B, P]
+            
+        else:
+            # Original: Aggregate first, then compute entropy
+            masked_sims = sim_scores * target_mask
+            masked_sims = torch.clamp(masked_sims, min=-1.0, max=1.0)
+            proto_probs = (masked_sims + 1.0) / 2.0
+            proto_probs = torch.clamp(proto_probs, min=eps, max=1-eps)
+            
+            # Minimize Binary Entropy for target prototypes
+            entropy = -(proto_probs * torch.log(proto_probs) + 
+                       (1 - proto_probs) * torch.log(1 - proto_probs))  # [B, P]
         
         # --- Prototype Importance Weighting ---
         if self.use_prototype_importance:
