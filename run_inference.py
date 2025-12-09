@@ -88,7 +88,8 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
                         use_geometric_filter=False, geo_filter_threshold=0.3,
                         consensus_strategy='max', consensus_ratio=0.5,
                         adaptation_mode='layernorm_only',
-                        use_ensemble_entropy=False):
+                        use_ensemble_entropy=False,
+                        source_proto_stats=None, alpha_source_kl=0.0):
     """Set up Prototype Entropy adaptation (without threshold).
     
     Args:
@@ -103,6 +104,8 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         consensus_ratio: For 'top_k_mean', fraction of sub-prototypes to use
         adaptation_mode: What parameters to adapt ('layernorm_only', 'layernorm_proto', etc.)
         use_ensemble_entropy: Treat sub-prototypes as ensemble (compute entropy per sub-proto, then average)
+        source_proto_stats: Pre-computed source prototype statistics
+        alpha_source_kl: Weight for source KL regularization
     """
     model = proto_entropy.configure_model(model, adaptation_mode=adaptation_mode)
     params, param_names = proto_entropy.collect_params(model, adaptation_mode=adaptation_mode)
@@ -125,7 +128,9 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         geo_filter_threshold=geo_filter_threshold,
         consensus_strategy=consensus_strategy,
         consensus_ratio=consensus_ratio,
-        use_ensemble_entropy=use_ensemble_entropy
+        use_ensemble_entropy=use_ensemble_entropy,
+        source_proto_stats=source_proto_stats,
+        alpha_source_kl=alpha_source_kl
     )
     return proto_model
 
@@ -395,7 +400,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                          use_geometric_filter=False, geo_filter_threshold=0.3, output_dir='./plots',
                          consensus_strategy='max', consensus_ratio=0.5,
                          adaptation_mode='layernorm_only',
-                         use_ensemble_entropy=False):
+                         use_ensemble_entropy=False,
+                         use_source_stats=False, alpha_source_kl=0.0, num_source_samples=500):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -440,6 +446,49 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     
     results = {}
     results_with_batches = {}  # Store per-batch data for plotting
+    
+    # --- Compute Source Prototype Statistics (if requested) ---
+    source_proto_stats = None
+    if use_source_stats and alpha_source_kl > 0:
+        print(f'\n>>> Computing source prototype statistics on clean data...')
+        print(f'Loading clean images from: {test_dir}')
+        
+        # Load a temporary model for computing source stats
+        temp_model = torch.load(model_path, weights_only=False)
+        temp_model = temp_model.to(device)
+        temp_model.eval()
+        
+        # Create clean data loader
+        transform_clean = transforms.Compose([
+            transforms.Resize(size=(img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+        clean_dataset = datasets.ImageFolder(test_dir, transform_clean)
+        
+        # Use subset for efficiency
+        if len(clean_dataset) > num_source_samples:
+            source_indices = torch.randperm(len(clean_dataset))[:num_source_samples]
+            source_subset = torch.utils.data.Subset(clean_dataset, source_indices)
+        else:
+            source_subset = clean_dataset
+        
+        source_loader = torch.utils.data.DataLoader(
+            source_subset, batch_size=32, shuffle=True, 
+            num_workers=4, pin_memory=True
+        )
+        
+        # Compute statistics
+        source_proto_stats = proto_entropy.compute_source_proto_stats(
+            temp_model, source_loader, device, num_samples=num_source_samples
+        )
+        
+        print(f"Source prototype statistics computed successfully.")
+        print("-" * 50)
+        
+        # Clean up
+        del temp_model
+        torch.cuda.empty_cache()
 
     # Determine which modes to run (supports comma-separated list).
     selected_modes = parse_modes(mode)
@@ -522,7 +571,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
         adapt_info = f", adapt={adaptation_mode}" if adaptation_mode != 'layernorm_only' else ""
         ensemble_info = ", ensemble_entropy=True" if use_ensemble_entropy else ""
-        print(f"Setting up ProtoEntropy (reset_mode={reset_mode}, freq={reset_frequency} batches{filter_info}{consensus_info}{adapt_info}{ensemble_info})...")
+        source_info = f", source_kl={alpha_source_kl}" if alpha_source_kl > 0 else ""
+        print(f"Setting up ProtoEntropy (reset_mode={reset_mode}, freq={reset_frequency} batches{filter_info}{consensus_info}{adapt_info}{ensemble_info}{source_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=False,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
@@ -530,7 +580,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                                          geo_filter_threshold=geo_filter_threshold,
                                          consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio,
                                          adaptation_mode=adaptation_mode,
-                                         use_ensemble_entropy=use_ensemble_entropy)
+                                         use_ensemble_entropy=use_ensemble_entropy,
+                                         source_proto_stats=source_proto_stats, alpha_source_kl=alpha_source_kl)
 
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
@@ -567,7 +618,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
         adapt_info = f", adapt={adaptation_mode}" if adaptation_mode != 'layernorm_only' else ""
         ensemble_info = ", ensemble_entropy=True" if use_ensemble_entropy else ""
-        print(f"Setting up ProtoEntropy+Importance (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info}{adapt_info}{ensemble_info})...")
+        source_info = f", source_kl={alpha_source_kl}" if alpha_source_kl > 0 else ""
+        print(f"Setting up ProtoEntropy+Importance (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info}{adapt_info}{ensemble_info}{source_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=False,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
@@ -575,7 +627,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                                          geo_filter_threshold=geo_filter_threshold,
                                          consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio,
                                          adaptation_mode=adaptation_mode,
-                                         use_ensemble_entropy=use_ensemble_entropy)
+                                         use_ensemble_entropy=use_ensemble_entropy,
+                                         source_proto_stats=source_proto_stats, alpha_source_kl=alpha_source_kl)
 
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
@@ -612,7 +665,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
         adapt_info = f", adapt={adaptation_mode}" if adaptation_mode != 'layernorm_only' else ""
         ensemble_info = ", ensemble_entropy=True" if use_ensemble_entropy else ""
-        print(f"Setting up ProtoEntropy+Confidence (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info}{adapt_info}{ensemble_info})...")
+        source_info = f", source_kl={alpha_source_kl}" if alpha_source_kl > 0 else ""
+        print(f"Setting up ProtoEntropy+Confidence (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info}{adapt_info}{ensemble_info}{source_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=False, use_confidence=True,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
@@ -620,7 +674,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                                          geo_filter_threshold=geo_filter_threshold,
                                          consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio,
                                          adaptation_mode=adaptation_mode,
-                                         use_ensemble_entropy=use_ensemble_entropy)
+                                         use_ensemble_entropy=use_ensemble_entropy,
+                                         source_proto_stats=source_proto_stats, alpha_source_kl=alpha_source_kl)
 
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
@@ -657,7 +712,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         consensus_info = f", consensus={consensus_strategy}" if consensus_strategy != 'max' else ""
         adapt_info = f", adapt={adaptation_mode}" if adaptation_mode != 'layernorm_only' else ""
         ensemble_info = ", ensemble_entropy=True" if use_ensemble_entropy else ""
-        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info}{adapt_info}{ensemble_info})...")
+        source_info = f", source_kl={alpha_source_kl}" if alpha_source_kl > 0 else ""
+        print(f"Setting up ProtoEntropy Imp+Conf (reset_mode={reset_mode}, freq={reset_frequency}{filter_info}{consensus_info}{adapt_info}{ensemble_info}{source_info})...")
         proto_model = setup_proto_entropy(base_model, use_importance=True, use_confidence=True,
                                          reset_mode=reset_mode, reset_frequency=reset_frequency,
                                          confidence_threshold=confidence_threshold, ema_alpha=ema_alpha,
@@ -665,7 +721,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                                          geo_filter_threshold=geo_filter_threshold,
                                          consensus_strategy=consensus_strategy, consensus_ratio=consensus_ratio,
                                          adaptation_mode=adaptation_mode,
-                                         use_ensemble_entropy=use_ensemble_entropy)
+                                         use_ensemble_entropy=use_ensemble_entropy,
+                                         source_proto_stats=source_proto_stats, alpha_source_kl=alpha_source_kl)
 
         # Reset stats before evaluation
         if hasattr(proto_model, 'reset_geo_filter_stats'):
@@ -1094,6 +1151,30 @@ if __name__ == '__main__':
              'Prevents single overconfident sub-prototype from dominating (requires sub-prototypes).'
     )
     
+    parser.add_argument(
+        '--use-source-stats',
+        action='store_true',
+        default=False,
+        help='Compute prototype activation statistics on clean source data (like EATA Fisher). '
+             'Requires access to clean data. Used for KL divergence regularization.'
+    )
+    
+    parser.add_argument(
+        '--alpha-source-kl',
+        type=float,
+        default=0.0,
+        help='Weight for KL divergence regularization to source prototype distribution (default: 0.0 = disabled). '
+             'Prevents test-time prototype activations from drifting too far from source distribution. '
+             'Typical values: 0.01 to 1.0. Only active if --use-source-stats is set.'
+    )
+    
+    parser.add_argument(
+        '--num-source-samples',
+        type=int,
+        default=500,
+        help='Number of clean source samples to use for computing prototype statistics (default: 500)'
+    )
+    
     args = parser.parse_args()
     
     # Handle no-corruption flag
@@ -1112,4 +1193,5 @@ if __name__ == '__main__':
                          args.reset_mode, args.reset_frequency, args.confidence_threshold, args.ema_alpha,
                          args.use_geometric_filter, args.geo_filter_threshold, args.output_dir,
                          args.consensus_strategy, args.consensus_ratio, args.adaptation_mode,
-                         args.use_ensemble_entropy)
+                         args.use_ensemble_entropy, args.use_source_stats, args.alpha_source_kl, 
+                         args.num_source_samples)

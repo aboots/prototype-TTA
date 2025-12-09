@@ -12,7 +12,8 @@ class ProtoEntropy(nn.Module):
                  confidence_threshold=0.7, ema_alpha=0.999,
                  use_geometric_filter=False, geo_filter_threshold=0.3,
                  consensus_strategy='max', consensus_ratio=0.5,
-                 use_ensemble_entropy=False):
+                 use_ensemble_entropy=False,
+                 source_proto_stats=None, alpha_source_kl=0.0):
         """
         Args:
             episodic: If True, uses 'episodic' reset_mode (backward compatibility)
@@ -36,6 +37,9 @@ class ProtoEntropy(nn.Module):
             consensus_ratio: For 'top_k_mean', what fraction of sub-prototypes to use (default: 0.5 = top 50%)
             use_ensemble_entropy: If True, treat sub-prototypes as ensemble: compute entropy per sub-proto, then average
                                  If False, aggregate sub-protos first, then compute entropy (default)
+            source_proto_stats: Dict with source prototype activation statistics (mean, std, distribution)
+                               Computed on clean/source data before adaptation
+            alpha_source_kl: Weight for KL divergence regularization to source distribution (default: 0.0 = disabled)
         """
         super().__init__()
         self.model = model
@@ -58,6 +62,10 @@ class ProtoEntropy(nn.Module):
         
         # Ensemble entropy parameter
         self.use_ensemble_entropy = use_ensemble_entropy
+        
+        # Source distribution matching parameters
+        self.source_proto_stats = source_proto_stats
+        self.alpha_source_kl = alpha_source_kl
         
         # New reset mechanism parameters
         # If reset_mode not specified, infer from episodic flag for backward compatibility
@@ -409,11 +417,38 @@ class ProtoEntropy(nn.Module):
             loss_coherence = coherence_loss.sum(dim=1) / (target_mask.sum(dim=1) + 1e-8)
             loss_coherence = (loss_coherence * reliable_mask).sum() / (reliable_mask.sum() + 1e-8)
 
+        # ========== PART D: Source Distribution KL Regularization ==========
+        loss_source_kl = 0.0
+        if self.alpha_source_kl > 0 and self.source_proto_stats is not None:
+            # Compute KL divergence between test and source prototype activation distributions
+            # sim_scores: [B, P] - current prototype similarities
+            
+            # Convert similarities to probabilities (softmax over prototypes)
+            test_proto_probs = F.softmax(sim_scores / 0.1, dim=1)  # Temperature=0.1 for sharpness
+            
+            # Get source distribution (pre-computed on clean data)
+            source_proto_probs = self.source_proto_stats['prototype_probs'].to(logits.device)  # [P]
+            
+            # KL(test || source): prevents test distribution from drifting too far from source
+            # This acts like Fisher regularization but at the prototype activation level
+            kl_div = F.kl_div(
+                test_proto_probs.log(),  # Log of test distribution
+                source_proto_probs.unsqueeze(0).expand(test_proto_probs.size(0), -1),  # Source distribution
+                reduction='none'
+            ).sum(dim=1)  # [B]
+            
+            # Only compute KL for reliable samples
+            loss_source_kl = (kl_div * reliable_mask).sum() / (reliable_mask.sum() + 1e-8)
+        
         # ========== Total Loss ==========
-        # Balance the three components using instance attributes
+        # Balance the components using instance attributes
         loss = self.alpha_target * loss_target + self.alpha_separation * loss_separation
         if isinstance(loss_coherence, torch.Tensor):
             loss = loss + self.alpha_coherence * loss_coherence
+        if isinstance(loss_source_kl, torch.Tensor) or (isinstance(loss_source_kl, (int, float)) and loss_source_kl != 0):
+            print (f"Loss source KL: {loss_source_kl}")
+            print (f"Loss: {loss}")
+            loss = loss + self.alpha_source_kl * loss_source_kl
 
         loss.backward()
         self.optimizer.step()
@@ -650,6 +685,83 @@ def configure_model(model, adaptation_mode='layernorm_only'):
                 p.requires_grad = True
     
     return model
+
+
+def compute_source_proto_stats(model, source_loader, device, num_samples=500):
+    """Compute prototype activation statistics on source/clean data.
+    
+    This is similar to EATA's Fisher computation but specifically for ProtoViT:
+    - Collects prototype similarity distributions on clean data
+    - Used as anchor to prevent test-time drift
+    
+    Args:
+        model: The ProtoViT model
+        source_loader: DataLoader with clean/source data
+        device: Device to run on
+        num_samples: Number of samples to use (default: 500)
+    
+    Returns:
+        Dictionary with statistics: {
+            'prototype_probs': Average probability distribution over prototypes,
+            'similarity_mean': Mean similarity per prototype,
+            'similarity_std': Std similarity per prototype
+        }
+    """
+    model.eval()
+    
+    all_similarities = []
+    total_samples = 0
+    
+    print(f"Computing source prototype statistics on {num_samples} clean samples...")
+    
+    with torch.no_grad():
+        for images, _ in source_loader:
+            images = images.to(device)
+            batch_size = images.size(0)
+            
+            if total_samples >= num_samples:
+                break
+            
+            # Forward pass to get prototype similarities
+            logits, _, similarities = model(images)
+            
+            # Aggregate sub-prototypes (using max, consistent with default)
+            if similarities.dim() == 3:
+                sim_scores, _ = similarities.max(dim=2)  # [B, P]
+            else:
+                sim_scores = similarities
+            
+            all_similarities.append(sim_scores.cpu())
+            total_samples += batch_size
+    
+    # Concatenate all similarities
+    all_similarities = torch.cat(all_similarities, dim=0)[:num_samples]  # [N, P]
+    
+    # Compute statistics
+    stats = {}
+    
+    # 1. Average probability distribution over prototypes (softmax)
+    #    This represents the "typical" prototype activation pattern on clean data
+    proto_probs_per_sample = F.softmax(all_similarities / 0.1, dim=1)  # [N, P]
+    stats['prototype_probs'] = proto_probs_per_sample.mean(dim=0)  # [P]
+    
+    # 2. Mean and std of similarities per prototype
+    stats['similarity_mean'] = all_similarities.mean(dim=0)  # [P]
+    stats['similarity_std'] = all_similarities.std(dim=0)  # [P]
+    
+    # 3. Optional: Adaptive threshold based on source data
+    #    Use mean - 2*std as a data-driven threshold
+    max_sims_per_sample = all_similarities.max(dim=1)[0]  # [N]
+    stats['adaptive_threshold'] = max_sims_per_sample.mean() - 2 * max_sims_per_sample.std()
+    stats['mean_max_similarity'] = max_sims_per_sample.mean()
+    stats['std_max_similarity'] = max_sims_per_sample.std()
+    
+    print(f"Source stats computed on {total_samples} samples:")
+    print(f"  Mean max similarity: {stats['mean_max_similarity']:.4f}")
+    print(f"  Std max similarity: {stats['std_max_similarity']:.4f}")
+    print(f"  Suggested adaptive threshold: {stats['adaptive_threshold'].item():.4f}")
+    
+    return stats
 
 
 def copy_model_and_optimizer(model, optimizer):
