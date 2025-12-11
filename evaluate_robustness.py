@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
 Comprehensive robustness evaluation script for ProtoViT on CUB-200-C.
-Evaluates model performance across all corruption types and severity levels.
+Evaluates model performance across specified corruption types at severity 5.
+Saves results iteratively to JSON for resumability.
 
 Usage:
-    # Evaluate on pre-generated CUB-C dataset
     python evaluate_robustness.py --model ./saved_models/best_model.pth \
                                    --data_dir ./datasets/cub200_c/ \
-                                   --mode all
-    
-    # Evaluate specific corruptions
-    python evaluate_robustness.py --model ./saved_models/best_model.pth \
-                                   --corruptions gaussian_noise shot_noise \
-                                   --mode normal,tent
-    
-    # Generate corruptions on-the-fly (slower but saves disk space)
-    python evaluate_robustness.py --model ./saved_models/best_model.pth \
-                                   --on_the_fly \
-                                   --clean_data_dir ./datasets/cub200_cropped/test_cropped/
+                                   --output ./robustness_results_sev5.json
 """
 
 import os
@@ -33,26 +23,28 @@ import json
 import time
 from datetime import datetime
 import logging
+from tqdm import tqdm
 
 # Import ProtoViT modules
 import model  # Necessary for torch.load
 import train_and_test as tnt
-from settings import img_size, k, sum_cls
+from settings import img_size, test_dir, test_batch_size, k, sum_cls
 from preprocess import mean, std
-from noise_utils import get_all_corruption_types, get_corrupted_transform
+from noise_utils import get_corrupted_transform
 import tent
 import proto_entropy
 import loss_adapt
-import fisher_proto
 import eata_adapt
-import memo_adapt
 import sar_adapt
-
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Set seeds
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
+np.random.seed(0)
 
 class Cfg:
     """Configuration for test-time adaptation methods."""
@@ -71,7 +63,6 @@ class Cfg:
     class Model:
         def __init__(self):
             self.EPISODIC = False
-
 
 cfg = Cfg()
 
@@ -94,24 +85,56 @@ def setup_tent(model):
     return tent.Tent(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
 
 
-def setup_proto_entropy(model, alpha_target=1.0, alpha_separation=0.5, alpha_coherence=0.3,
-                       use_prototype_importance=False):
-    """Set up ProtoEntropy adaptation (without threshold)."""
-    model = proto_entropy.configure_model(model)
-    params, param_names = proto_entropy.collect_params(model)
+def setup_proto_entropy(model, use_importance=False, use_confidence=False, 
+                        reset_mode=None, reset_frequency=10, 
+                        confidence_threshold=0.7, ema_alpha=0.999,
+                        use_geometric_filter=False, geo_filter_threshold=0.3,
+                        consensus_strategy='max', consensus_ratio=0.5,
+                        adaptation_mode='layernorm_only',
+                        use_ensemble_entropy=False,
+                        source_proto_stats=None, alpha_source_kl=0.0):
+    """Set up Prototype Entropy adaptation (without threshold).
+    
+    Args:
+        use_importance: Use prototype importance weighting
+        use_confidence: Use confidence weighting
+        reset_mode: 'episodic', 'periodic', 'confidence', 'hybrid', 'ema', 'none'
+        reset_frequency: How often to reset in 'periodic'/'hybrid' modes (in BATCHES)
+        confidence_threshold: Confidence threshold for 'confidence'/'hybrid' modes
+        ema_alpha: EMA decay for 'ema' mode
+        use_geometric_filter: Use geometric similarity to filter unreliable samples
+        geo_filter_threshold: Minimum similarity to ANY prototype to be considered reliable
+        consensus_strategy: How to aggregate sub-prototypes
+        consensus_ratio: For 'top_k_mean', fraction of sub-prototypes to use
+        adaptation_mode: What parameters to adapt
+        use_ensemble_entropy: Treat sub-prototypes as ensemble
+        source_proto_stats: Pre-computed source prototype statistics
+        alpha_source_kl: Weight for source KL regularization
+    """
+    model = proto_entropy.configure_model(model, adaptation_mode=adaptation_mode)
+    params, param_names = proto_entropy.collect_params(model, adaptation_mode=adaptation_mode)
+    
     optimizer = setup_optimizer(params)
-    return proto_entropy.ProtoEntropy(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC,
-                                     alpha_target=alpha_target, alpha_separation=alpha_separation, 
-                                     alpha_coherence=alpha_coherence,
-                                     use_prototype_importance=use_prototype_importance)
-
-
-def setup_proto_entropy_eata(model, entropy_threshold=0.4):
-    """Set up ProtoEntropy adaptation with EATA-style thresholding."""
-    model = proto_entropy.configure_model(model)
-    params, param_names = proto_entropy.collect_params(model)
-    optimizer = setup_optimizer(params)
-    return proto_entropy.ProtoEntropyEATA(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC, entropy_threshold=entropy_threshold)
+    proto_model = proto_entropy.ProtoEntropy(
+        model,
+        optimizer,
+        steps=cfg.OPTIM.STEPS,
+        episodic=cfg.MODEL.EPISODIC,
+        use_prototype_importance=use_importance,
+        use_confidence_weighting=use_confidence,
+        reset_mode=reset_mode,
+        reset_frequency=reset_frequency,
+        confidence_threshold=confidence_threshold,
+        ema_alpha=ema_alpha,
+        use_geometric_filter=use_geometric_filter,
+        geo_filter_threshold=geo_filter_threshold,
+        consensus_strategy=consensus_strategy,
+        consensus_ratio=consensus_ratio,
+        use_ensemble_entropy=use_ensemble_entropy,
+        source_proto_stats=source_proto_stats,
+        alpha_source_kl=alpha_source_kl
+    )
+    return proto_model
 
 
 def setup_loss_adapt(model):
@@ -120,16 +143,6 @@ def setup_loss_adapt(model):
     params, param_names = loss_adapt.collect_params(model)
     optimizer = setup_optimizer(params)
     return loss_adapt.LossAdapt(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
-
-
-def setup_fisher_proto(model):
-    """Set up Fisher-guided prototype adaptation."""
-    model = fisher_proto.configure_model(model)
-    params, param_names = fisher_proto.collect_params(model)
-    optimizer = setup_optimizer(params)
-    fisher_model = fisher_proto.FisherProto(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
-    device = next(model.parameters()).device
-    return fisher_model.to(device)
 
 
 def setup_eata(model, fishers):
@@ -148,33 +161,6 @@ def setup_sar(model):
     base_optimizer = torch.optim.SGD
     optimizer = sar_adapt.SAM(params, base_optimizer, lr=cfg.OPTIM.LR, momentum=0.9)
     return sar_adapt.SAR(model, optimizer, steps=cfg.OPTIM.STEPS, episodic=cfg.MODEL.EPISODIC)
-
-
-def setup_memo(model, lr=0.00025, batch_size=64, steps=1):
-    """Set up MEMO adaptation.
-    
-    MEMO (Test Time Robustness via Adaptation and Augmentation) adapts
-    the model to each test sample by minimizing the entropy of the marginal
-    distribution over multiple augmented views.
-    
-    Args:
-        model: The model to adapt
-        lr: Learning rate for adaptation (default: 0.00025)
-        batch_size: Number of augmented views per step (default: 64)
-        steps: Number of adaptation steps per sample (default: 1)
-    
-    Returns:
-        MEMO-wrapped model
-    """
-    model = memo_adapt.configure_model(model)
-    params, param_names = memo_adapt.collect_params(model)
-    
-    # MEMO uses SGD optimizer with momentum
-    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0)
-    
-    return memo_adapt.MEMO(model, optimizer, steps=steps, 
-                          batch_size=batch_size, episodic=True)
-
 
 
 def evaluate_model(model, loader, description="Inference", verbose=True):
@@ -198,8 +184,11 @@ def evaluate_model(model, loader, description="Inference", verbose=True):
     return accu
 
 
-def load_corrupted_dataset(data_dir, corruption_type, severity, batch_size=128):
+def load_corrupted_dataset(data_dir, corruption_type, severity, batch_size=None):
     """Load a pre-generated corrupted dataset."""
+    if batch_size is None:
+        batch_size = test_batch_size
+    
     corruption_path = Path(data_dir) / corruption_type / str(severity)
     
     if not corruption_path.exists():
@@ -218,15 +207,18 @@ def load_corrupted_dataset(data_dir, corruption_type, severity, batch_size=128):
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=8,
+        pin_memory=False
     )
     
     return loader
 
 
-def load_dataset_with_corruption(clean_data_dir, corruption_type, severity, batch_size=128):
+def load_dataset_with_corruption(clean_data_dir, corruption_type, severity, batch_size=None):
     """Load clean dataset and apply corruption on-the-fly."""
+    if batch_size is None:
+        batch_size = test_batch_size
+    
     transform = get_corrupted_transform(img_size, mean, std, corruption_type, severity)
     
     dataset = datasets.ImageFolder(clean_data_dir, transform)
@@ -234,20 +226,66 @@ def load_dataset_with_corruption(clean_data_dir, corruption_type, severity, batc
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=8,
+        pin_memory=False
     )
     
     return loader
 
 
-def evaluate_corruption(model_path, corruption_type, severity, data_dir, 
-                       clean_data_dir, on_the_fly, modes, device, batch_size, fishers=None, proto_threshold=None):
-    """Evaluate model on a single corruption type and severity."""
-    results = {}
+def load_results_json(output_file):
+    """Load existing results from JSON file."""
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Could not load existing results from {output_file}: {e}")
+            logger.warning("Starting fresh...")
+    return None
+
+
+def save_results_json(output_file, results_dict, metadata=None):
+    """Save results to JSON file."""
+    output_data = {
+        'timestamp': datetime.now().isoformat(),
+        'metadata': metadata or {},
+        'results': results_dict
+    }
     
-    # Load data
+    # Create backup before writing
+    if os.path.exists(output_file):
+        backup_file = output_file + '.backup'
+        try:
+            import shutil
+            shutil.copy2(output_file, backup_file)
+        except Exception as e:
+            logger.warning(f"Could not create backup: {e}")
+    
+    # Write to temporary file first, then rename (atomic write)
+    temp_file = output_file + '.tmp'
     try:
+        with open(temp_file, 'w') as f:
+            json.dump(output_data, f, indent=2)
+        os.replace(temp_file, output_file)
+    except Exception as e:
+        logger.error(f"Failed to save results: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        raise
+
+
+def evaluate_single_combination(model_path, corruption_type, severity, data_dir, 
+                               clean_data_dir, on_the_fly, mode_name, mode_config, 
+                               device, batch_size, fishers=None):
+    """Evaluate a single mode on a single corruption-severity combination.
+    
+    Args:
+        mode_name: Name of the mode (e.g., 'normal', 'tent', 'proto_imp_conf_v1')
+        mode_config: Dict with setup parameters for this mode
+    """
+    try:
+        # Load data
         if on_the_fly:
             loader = load_dataset_with_corruption(clean_data_dir, corruption_type, severity, batch_size)
         else:
@@ -255,202 +293,86 @@ def evaluate_corruption(model_path, corruption_type, severity, data_dir,
     except Exception as e:
         logger.error(f"Failed to load data for {corruption_type}-{severity}: {e}")
         return None
-
-    # If EATA is requested, compute Fishers on this test data (source-free setting)
-    # We compute it once per corruption-severity setting using the current loader.
-    if 'eata' in modes and fishers is None:
-        try:
-            # Load fresh model for Fisher computation
-            fisher_model = torch.load(model_path, weights_only=False)
-            fisher_model = fisher_model.to(device)
-            fisher_model = eata_adapt.configure_model(fisher_model)
-            
-            # Compute Fishers on first 2000 samples of the current loader
-            # Note: We pass the loader directly; compute_fishers handles early stopping
-            current_fishers = eata_adapt.compute_fishers(fisher_model, loader, device, num_samples=2000)
-            
-            del fisher_model
-            torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Failed to compute Fishers for {corruption_type}-{severity}: {e}")
-            current_fishers = None
-    else:
-        current_fishers = fishers
     
-    # Evaluate each mode
-    for mode in modes:
-        try:
-            # Load fresh model
-            base_model = torch.load(model_path, weights_only=False)
-            base_model = base_model.to(device)
-            base_model.eval()
+    try:
+        # Load fresh model
+        base_model = torch.load(model_path, weights_only=False)
+        base_model = base_model.to(device)
+        base_model.eval()
+        
+        # Setup adaptation based on mode
+        if mode_name == 'normal':
+            eval_model = base_model
+        elif mode_name == 'tent':
+            eval_model = setup_tent(base_model)
+        elif mode_name.startswith('proto_imp_conf'):
+            # ProtoEntropy with Importance+Confidence
+            eval_model = setup_proto_entropy(
+                base_model,
+                use_importance=True,
+                use_confidence=True,
+                reset_mode=mode_config.get('reset_mode', None),
+                reset_frequency=mode_config.get('reset_frequency', 10),
+                confidence_threshold=mode_config.get('confidence_threshold', 0.7),
+                ema_alpha=mode_config.get('ema_alpha', 0.999),
+                use_geometric_filter=mode_config.get('use_geometric_filter', False),
+                geo_filter_threshold=mode_config.get('geo_filter_threshold', 0.3),
+                consensus_strategy=mode_config.get('consensus_strategy', 'max'),
+                consensus_ratio=mode_config.get('consensus_ratio', 0.5),
+                adaptation_mode=mode_config.get('adaptation_mode', 'layernorm_only'),
+                use_ensemble_entropy=mode_config.get('use_ensemble_entropy', False),
+                source_proto_stats=mode_config.get('source_proto_stats', None),
+                alpha_source_kl=mode_config.get('alpha_source_kl', 0.0)
+            )
             
-            # Setup adaptation if needed
-            if mode == 'normal':
-                eval_model = base_model
-            elif mode == 'tent':
-                eval_model = setup_tent(base_model)
-            elif mode == 'proto':
-                eval_model = setup_proto_entropy(base_model)
-            elif mode == 'proto_eata':
-                eval_model = setup_proto_entropy_eata(base_model, entropy_threshold=proto_threshold)
-            elif mode == 'loss':
-                eval_model = setup_loss_adapt(base_model)
-            elif mode == 'fisher':
-                eval_model = setup_fisher_proto(base_model)
-            elif mode == 'eata':
-                if current_fishers is None:
-                    raise ValueError("Fishers could not be computed for EATA")
-                eval_model = setup_eata(base_model, current_fishers)
-            elif mode == 'sar':
-                eval_model = setup_sar(base_model)
-            elif mode == 'memo':
-                eval_model = setup_memo(base_model, lr=0.00025, batch_size=64, steps=1)
+            # Reset geo filter stats if applicable
+            if mode_config.get('use_geometric_filter', False) and hasattr(eval_model, 'reset_geo_filter_stats'):
+                eval_model.reset_geo_filter_stats()
+        elif mode_name == 'loss':
+            eval_model = setup_loss_adapt(base_model)
+        elif mode_name == 'eata':
+            if fishers is None:
+                # Compute Fishers on test data (source-free)
+                fisher_model = torch.load(model_path, weights_only=False)
+                fisher_model = fisher_model.to(device)
+                fisher_model = eata_adapt.configure_model(fisher_model)
+                current_fishers = eata_adapt.compute_fishers(fisher_model, loader, device, num_samples=500)
+                del fisher_model
+                torch.cuda.empty_cache()
             else:
-                logger.warning(f"Unknown mode: {mode}")
-                continue
+                current_fishers = fishers
             
-            # Evaluate
-            acc = evaluate_model(eval_model, loader, 
-                               description=f"{mode.capitalize()} on {corruption_type}-{severity}",
-                               verbose=False)
-            results[mode] = float(acc)
-            
-            # Cleanup
-            del eval_model
-            del base_model
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            logger.error(f"Failed to evaluate {mode} on {corruption_type}-{severity}: {e}")
-            results[mode] = None
-    
-    return results
-
-
-
-def compute_metrics(results_dict):
-    """
-    Compute mCE (mean Corruption Error) and other aggregate metrics.
-    
-    Note: True mCE requires baseline model errors. Here we compute mean accuracy.
-    """
-    metrics = {}
-    
-    for mode in ['normal', 'tent', 'proto', 'proto_eata', 'loss', 'fisher', 'eata', 'sar', 'memo']:
-        if mode not in results_dict:
-            continue
+            if current_fishers is None:
+                raise ValueError("Fishers could not be computed for EATA")
+            eval_model = setup_eata(base_model, current_fishers)
+        elif mode_name == 'sar':
+            eval_model = setup_sar(base_model)
+        else:
+            logger.warning(f"Unknown mode: {mode_name}")
+            return None
         
-        all_accuracies = []
-        corruption_means = {}
+        # Evaluate
+        acc = evaluate_model(eval_model, loader, 
+                           description=f"{mode_name} on {corruption_type}-{severity}",
+                           verbose=False)
         
-        for corruption_type, severities in results_dict[mode].items():
-            if corruption_type == 'clean':
-                continue
-            
-            valid_accs = [acc for acc in severities.values() if acc is not None]
-            if valid_accs:
-                corruption_means[corruption_type] = np.mean(valid_accs)
-                all_accuracies.extend(valid_accs)
+        # Cleanup
+        del eval_model
+        del base_model
+        torch.cuda.empty_cache()
         
-        if all_accuracies:
-            metrics[mode] = {
-                'mean_accuracy': np.mean(all_accuracies),
-                'std_accuracy': np.std(all_accuracies),
-                'min_accuracy': np.min(all_accuracies),
-                'max_accuracy': np.max(all_accuracies),
-                'corruption_means': corruption_means
-            }
-    
-    return metrics
-
-
-def print_results_table(results_dict, metrics, clean_results=None):
-    """Print formatted results table."""
-    print("\n" + "="*80)
-    print("ROBUSTNESS EVALUATION RESULTS")
-    print("="*80)
-    
-    # Print clean accuracy if available
-    if clean_results:
-        print("\nClean Data Performance:")
-        print("-" * 40)
-        for mode, acc in clean_results.items():
-            if acc is not None:
-                print(f"  {mode.capitalize():15s}: {acc*100:6.2f}%")
-    
-    # Print per-corruption results
-    print("\n" + "="*80)
-    print("Per-Corruption Results (all severities)")
-    print("="*80)
-    
-    modes = [m for m in ['normal', 'tent', 'proto', 'proto_eata', 'loss', 'fisher', 'eata', 'sar', 'memo'] if m in results_dict]
-    
-    if not modes:
-        print("No results to display.")
-        return
-    
-    # Header
-    header = f"{'Corruption':<20s}"
-    for mode in modes:
-        header += f" {mode.capitalize():>12s}"
-    print(header)
-    print("-" * 80)
-    
-    # Get all corruption types
-    corruption_types = list(results_dict[modes[0]].keys())
-    corruption_types = [c for c in corruption_types if c != 'clean']
-    corruption_types.sort()
-    
-    # Print results for each corruption
-    for corruption in corruption_types:
-        line = f"{corruption:<20s}"
-        for mode in modes:
-            if corruption in results_dict[mode]:
-                severities = results_dict[mode][corruption]
-                valid_accs = [acc for acc in severities.values() if acc is not None]
-                if valid_accs:
-                    mean_acc = np.mean(valid_accs)
-                    line += f" {mean_acc*100:11.2f}%"
-                else:
-                    line += f" {'N/A':>12s}"
-            else:
-                line += f" {'N/A':>12s}"
-        print(line)
-    
-    # Print summary metrics
-    print("\n" + "="*80)
-    print("Summary Metrics")
-    print("="*80)
-    
-    for mode in modes:
-        if mode in metrics:
-            m = metrics[mode]
-            print(f"\n{mode.capitalize()}:")
-            print(f"  Mean Accuracy:  {m['mean_accuracy']*100:.2f}%")
-            print(f"  Std Accuracy:   {m['std_accuracy']*100:.2f}%")
-            print(f"  Min Accuracy:   {m['min_accuracy']*100:.2f}%")
-            print(f"  Max Accuracy:   {m['max_accuracy']*100:.2f}%")
-
-
-def save_results(results_dict, metrics, output_file, clean_results=None):
-    """Save results to JSON file."""
-    output_data = {
-        'timestamp': datetime.now().isoformat(),
-        'clean_results': clean_results,
-        'corruption_results': results_dict,
-        'metrics': metrics
-    }
-    
-    with open(output_file, 'w') as f:
-        json.dump(output_data, f, indent=2)
-    
-    print(f"\nResults saved to: {output_file}")
+        return float(acc)
+        
+    except Exception as e:
+        logger.error(f"Failed to evaluate {mode_name} on {corruption_type}-{severity}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Comprehensive robustness evaluation on CUB-200-C',
+        description='Comprehensive robustness evaluation on CUB-200-C (Severity 5)',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -462,28 +384,18 @@ def main():
                        default='./datasets/cub200_c/',
                        help='Path to pre-generated CUB-C dataset')
     parser.add_argument('--clean_data_dir', type=str,
-                       default='./datasets/cub200_cropped/test_cropped/',
-                       help='Path to clean test data (for on-the-fly or clean evaluation)')
-    
-    # Evaluation settings
-    parser.add_argument('--corruptions', nargs='+', default=['all'],
-                       help='Corruption types to evaluate. Use "all" for all types.')
-    parser.add_argument('--severities', nargs='+', type=int, default=[2, 3, 4, 5],
-                       help='Severity levels to evaluate (1-5)')
-    parser.add_argument('--mode', type=str, default='all',
-                       help='Evaluation modes: normal, tent, proto, proto_eata, loss, fisher, eata, sar, memo, or "all" (comma-separated)')
+                       default=None,
+                       help='Path to clean test data (for on-the-fly). Default: uses test_dir from settings.')
     
     # Data loading
     parser.add_argument('--on_the_fly', action='store_true',
                        help='Generate corruptions on-the-fly instead of loading pre-generated')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size for evaluation')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help=f'Batch size for evaluation (default: {test_batch_size} from settings)')
     
     # Output
-    parser.add_argument('--output', type=str, default='./robustness_results.json',
+    parser.add_argument('--output', type=str, default='./robustness_results_sev5.json',
                        help='Path to save results JSON')
-    parser.add_argument('--eval_clean', action='store_true',
-                       help='Also evaluate on clean (uncorrupted) test data')
     
     # Hardware
     parser.add_argument('--gpuid', type=str, default='0',
@@ -492,10 +404,7 @@ def main():
     # EATA settings
     parser.add_argument('--use_clean_fisher', action='store_true', default=False,
                        help='Use clean data to compute Fisher Information Matrix for EATA. Default is False (use test data).')
-
-    parser.add_argument('--proto_threshold', type=float, default=0.4,
-                       help='Entropy threshold for ProtoEntropy+EATA adaptation (default: 0.4).')
-
+    
     args = parser.parse_args()
     
     # Setup device
@@ -503,21 +412,68 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    # Determine corruption types
-    if 'all' in args.corruptions:
-        corruption_types = get_all_corruption_types()
-    else:
-        corruption_types = args.corruptions
-    
-    # Determine modes
-    if args.mode.lower() == 'all':
-        modes = ['normal', 'tent', 'proto', 'proto_eata', 'loss', 'fisher', 'eata', 'sar', 'memo']
-    else:
-        modes = [m.strip().lower() for m in args.mode.split(',')]
+    # Use clean_data_dir from args or fallback to settings
+    clean_data_dir = args.clean_data_dir if args.clean_data_dir else test_dir
+    batch_size = args.batch_size if args.batch_size else test_batch_size
     
     # Verify model exists
     if not os.path.exists(args.model):
         raise FileNotFoundError(f"Model not found: {args.model}")
+    
+    # Define corruption types (severity 5 only)
+    corruption_types = [
+        'gaussian_noise', 'fog', 'gaussian_blur', 'elastic_transform', 
+        'brightness', 'jpeg_compression', 'contrast', 'defocus_blur', 
+        'frost', 'impulse_noise', 'pixelate', 'saturate', 'shot_noise', 
+        'spatter', 'speckle_noise'
+    ]
+    severity = 5
+    
+    # Define modes with their configurations
+    # proto_imp_conf has 3 variations
+    modes = {
+        'normal': {},
+        'tent': {},
+        'proto_imp_conf_v1': {  # Full config
+            'use_geometric_filter': True,
+            'geo_filter_threshold': 0.92,
+            'consensus_strategy': 'top_k_mean',
+            'adaptation_mode': 'layernorm_attn_bias',
+            'use_ensemble_entropy': True,
+            'reset_mode': None,
+            'reset_frequency': 10,
+            'confidence_threshold': 0.7,
+            'ema_alpha': 0.999,
+            'consensus_ratio': 0.5,
+        },
+        'proto_imp_conf_v2': {  # Without layernorm_attn_bias (default layernorm_only)
+            'use_geometric_filter': True,
+            'geo_filter_threshold': 0.92,
+            'consensus_strategy': 'top_k_mean',
+            'adaptation_mode': 'layernorm_only',  # Default
+            'use_ensemble_entropy': True,
+            'reset_mode': None,
+            'reset_frequency': 10,
+            'confidence_threshold': 0.7,
+            'ema_alpha': 0.999,
+            'consensus_ratio': 0.5,
+        },
+        'proto_imp_conf_v3': {  # Without use_ensemble_entropy
+            'use_geometric_filter': True,
+            'geo_filter_threshold': 0.92,
+            'consensus_strategy': 'top_k_mean',
+            'adaptation_mode': 'layernorm_attn_bias',
+            'use_ensemble_entropy': False,  # Disabled
+            'reset_mode': None,
+            'reset_frequency': 10,
+            'confidence_threshold': 0.7,
+            'ema_alpha': 0.999,
+            'consensus_ratio': 0.5,
+        },
+        'loss': {},
+        'eata': {},
+        'sar': {},
+    }
     
     # Compute Fishers GLOBAL if requested (Clean Data Access)
     fishers = None
@@ -536,7 +492,7 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
         ])
-        clean_dataset = datasets.ImageFolder(args.clean_data_dir, transform_clean)
+        clean_dataset = datasets.ImageFolder(clean_data_dir, transform_clean)
         
         num_fisher_samples = 2000
         if len(clean_dataset) > num_fisher_samples:
@@ -557,153 +513,140 @@ def main():
         del base_model
         torch.cuda.empty_cache()
     
+    # Load existing results if available
+    existing_results = load_results_json(args.output)
+    if existing_results:
+        results_dict = existing_results.get('results', {})
+        print(f"Loaded existing results from {args.output}")
+        print(f"  Found {len(results_dict)} modes with partial results")
+    else:
+        results_dict = {}
+    
+    # Initialize results structure
+    for mode_name in modes.keys():
+        if mode_name not in results_dict:
+            results_dict[mode_name] = {}
+        for corruption_type in corruption_types:
+            if corruption_type not in results_dict[mode_name]:
+                results_dict[mode_name][corruption_type] = {}
+    
     # Print configuration
     print("="*80)
     print("ROBUSTNESS EVALUATION CONFIGURATION")
     print("="*80)
     print(f"Model:           {args.model}")
     print(f"Data directory:  {args.data_dir if not args.on_the_fly else 'On-the-fly generation'}")
+    print(f"Clean data dir:  {clean_data_dir}")
     print(f"Corruptions:     {len(corruption_types)} types")
-    print(f"Severities:      {args.severities}")
-    print(f"Modes:           {', '.join(modes)}")
-    print(f"Batch size:      {args.batch_size}")
+    print(f"Severity:        {severity}")
+    print(f"Modes:           {', '.join(modes.keys())}")
+    print(f"Batch size:      {batch_size}")
     print(f"Output file:     {args.output}")
     print("="*80)
     
-    # Evaluate clean data if requested
-    clean_results = {}
-    if args.eval_clean:
-        print("\n" + "="*80)
-        print("Evaluating on Clean Data")
-        print("="*80)
-        
-        transform = transforms.Compose([
-            transforms.Resize(size=(img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
-        ])
-        
-        clean_dataset = datasets.ImageFolder(args.clean_data_dir, transform)
-        clean_loader = torch.utils.data.DataLoader(
-            clean_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-        
-        for mode in modes:
-            base_model = torch.load(args.model, weights_only=False)
-            base_model = base_model.to(device)
-            base_model.eval()
-            
-            if mode == 'normal':
-                eval_model = base_model
-            elif mode == 'tent':
-                eval_model = setup_tent(base_model)
-            elif mode == 'proto':
-                eval_model = setup_proto_entropy(base_model)
-            elif mode == 'proto_eata':
-                eval_model = setup_proto_entropy_eata(base_model, entropy_threshold=args.proto_threshold)
-            elif mode == 'loss':
-                eval_model = setup_loss_adapt(base_model)
-            elif mode == 'fisher':
-                eval_model = setup_fisher_proto(base_model)
-            elif mode == 'eata':
-                # For clean data eval, compute Fisher on clean data
-                if fishers is None:
-                    # Compute on clean loader if not provided
-                    print("Computing Fisher on clean data for clean eval...")
-                    fisher_model = torch.load(args.model, weights_only=False)
-                    fisher_model = fisher_model.to(device)
-                    fisher_model = eata_adapt.configure_model(fisher_model)
-                    fishers = eata_adapt.compute_fishers(fisher_model, clean_loader, device, num_samples=2000)
-                    del fisher_model
-                
-                eval_model = setup_eata(base_model, fishers)
-            elif mode == 'sar':
-                eval_model = setup_sar(base_model)
-            elif mode == 'memo':
-                eval_model = setup_memo(base_model, lr=0.00025, batch_size=64, steps=1)
-            
-            acc = evaluate_model(eval_model, clean_loader, 
-                               description=f"Clean data - {mode.capitalize()}")
-            clean_results[mode] = float(acc)
-            
-            del eval_model
-            del base_model
-            torch.cuda.empty_cache()
+    # Create list of all combinations to evaluate
+    all_combinations = []
+    for mode_name in modes.keys():
+        for corruption_type in corruption_types:
+            # Check if already completed
+            if (corruption_type in results_dict[mode_name] and 
+                severity in results_dict[mode_name][corruption_type] and
+                results_dict[mode_name][corruption_type][severity] is not None):
+                continue  # Skip already completed
+            all_combinations.append((mode_name, corruption_type))
     
-    # Initialize results dictionary
-    results_dict = {mode: {} for mode in modes}
+    total_combinations = len(all_combinations)
+    print(f"\nTotal combinations to evaluate: {total_combinations}")
+    if total_combinations == 0:
+        print("All combinations already completed!")
+        return
     
-    # Evaluate each corruption and severity
-    print("\n" + "="*80)
-    print("Evaluating Corruptions")
-    print("="*80)
-    
-    total_evaluations = len(corruption_types) * len(args.severities) * len(modes)
-    current_eval = 0
-    
+    # Evaluate each combination with progress bar
     start_time = time.time()
     
-    for corruption_type in corruption_types:
-        print(f"\n{'='*80}")
-        print(f"Corruption: {corruption_type}")
-        print(f"{'='*80}")
+    pbar = tqdm(all_combinations, desc="Evaluating", unit="comb")
+    for mode_name, corruption_type in pbar:
+        pbar.set_description(f"Evaluating {mode_name} on {corruption_type}")
         
-        for mode in modes:
-            results_dict[mode][corruption_type] = {}
+        acc = evaluate_single_combination(
+            args.model,
+            corruption_type,
+            severity,
+            args.data_dir,
+            clean_data_dir,
+            args.on_the_fly,
+            mode_name,
+            modes[mode_name],
+            device,
+            batch_size,
+            fishers=fishers
+        )
         
-        for severity in args.severities:
-            print(f"\n  Severity {severity}:")
+        # Update results
+        results_dict[mode_name][corruption_type][severity] = acc
+        
+        # Save after each combination (iterative saving)
+        try:
+            metadata = {
+                'model_path': args.model,
+                'data_dir': args.data_dir,
+                'clean_data_dir': clean_data_dir,
+                'on_the_fly': args.on_the_fly,
+                'batch_size': batch_size,
+                'severity': severity,
+                'corruption_types': corruption_types,
+                'modes': list(modes.keys()),
+                'mode_configs': modes
+            }
+            save_results_json(args.output, results_dict, metadata)
             
-            # Evaluate this corruption-severity combination
-            results = evaluate_corruption(
-                args.model,
-                corruption_type,
-                severity,
-                args.data_dir,
-                args.clean_data_dir,
-                args.on_the_fly,
-                modes,
-                device,
-                args.batch_size,
-                fishers=fishers,  # Pass globally computed fishers (if any)
-                proto_threshold=args.proto_threshold
-            )
-            
-            if results:
-                for mode in modes:
-                    if mode in results:
-                        results_dict[mode][corruption_type][severity] = results[mode]
-                        if results[mode] is not None:
-                            print(f"    {mode.capitalize():12s}: {results[mode]*100:.2f}%")
-                        current_eval += 1
-            
-            # Progress update
-            elapsed = time.time() - start_time
-            avg_time = elapsed / max(current_eval, 1)
-            remaining = (total_evaluations - current_eval) * avg_time
-            print(f"  Progress: {current_eval}/{total_evaluations} "
-                  f"({current_eval/total_evaluations*100:.1f}%) "
-                  f"- Est. remaining: {remaining/60:.1f} min")
+            # Update progress bar with accuracy
+            if acc is not None:
+                pbar.set_postfix({'acc': f'{acc*100:.2f}%', 'saved': '✓'})
+            else:
+                pbar.set_postfix({'acc': 'FAILED', 'saved': '✓'})
+        except Exception as e:
+            logger.error(f"Failed to save results: {e}")
+            pbar.set_postfix({'acc': 'ERROR', 'saved': '✗'})
     
-    # Compute aggregate metrics
-    metrics = compute_metrics(results_dict)
+    pbar.close()
     
-    # Print results
-    print_results_table(results_dict, metrics, clean_results)
-    
-    # Save results
-    save_results(results_dict, metrics, args.output, clean_results)
-    
+    # Final summary
     print("\n" + "="*80)
     print("EVALUATION COMPLETE")
+    print("="*80)
     print(f"Total time: {(time.time() - start_time)/60:.1f} minutes")
+    print(f"Results saved to: {args.output}")
+    
+    # Print summary table
+    print("\n" + "="*80)
+    print("RESULTS SUMMARY")
+    print("="*80)
+    
+    # Header
+    header = f"{'Corruption':<25s}"
+    for mode_name in modes.keys():
+        header += f" {mode_name[:15]:>15s}"
+    print(header)
+    print("-" * (25 + 16 * len(modes)))
+    
+    # Results for each corruption
+    for corruption_type in corruption_types:
+        line = f"{corruption_type:<25s}"
+        for mode_name in modes.keys():
+            if (corruption_type in results_dict[mode_name] and 
+                severity in results_dict[mode_name][corruption_type]):
+                acc = results_dict[mode_name][corruption_type][severity]
+                if acc is not None:
+                    line += f" {acc*100:14.2f}%"
+                else:
+                    line += f" {'N/A':>15s}"
+            else:
+                line += f" {'N/A':>15s}"
+        print(line)
+    
     print("="*80)
 
 
 if __name__ == '__main__':
     main()
-

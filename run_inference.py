@@ -506,8 +506,13 @@ def evaluate_model(model, loader, description="Inference", track_per_batch=False
                         precomputed = None  # Would need another forward pass, but this shouldn't happen for PPNet
                     
                     # Use batch version to preserve batch statistics (crucial for TTA methods)
-                    # Sort by activation (default) - we'll re-sort for contribution view later if needed
-                    batch_details_list = interpretability_viz.get_top_k_prototypes_batch(ppnet, images, k=10, precomputed_outputs=precomputed, sort_by='activation')
+                    # IMPORTANT: Save ALL prototypes (k=None) so we can properly sort by weight later
+                    # We'll filter to top-k during visualization, but need all data for proper sorting
+                    batch_details_list = interpretability_viz.get_top_k_prototypes_batch(
+                        ppnet, images, k=None,  # k=None means save ALL prototypes
+                        precomputed_outputs=precomputed, 
+                        sort_by='activation'
+                    )
                     
                     batch_details = []
                     for results, pred_cls in batch_details_list:

@@ -67,10 +67,10 @@ def get_top_k_prototypes_batch(model, image_batch, k=10, precomputed_outputs=Non
     Args:
         model: PPNet model
         image_batch: [B, C, H, W] tensor
-        k: top-k
+        k: top-k (if None, returns ALL prototypes - useful for later sorting by weight)
         precomputed_outputs: Optional tuple of (logits, min_distances, values) from a previous forward pass.
                            If provided, skips the forward pass to avoid double adaptation in TTA methods.
-        sort_by: 'activation' (default), 'contribution' (activation * max(weight, 0)), or 'weight' (weight only)
+        sort_by: 'activation' (default), 'contribution' (activation * max(weight, 0)), 'weight' (weight only), or 'predicted_class_activation' (activation * weight for predicted class prototypes)
         
     Returns:
         List of (results, pred_class) tuples, one for each image in batch.
@@ -118,10 +118,12 @@ def get_top_k_prototypes_batch(model, image_batch, k=10, precomputed_outputs=Non
             
             # Compute sorting criterion
             if sort_by == 'contribution':
-                # Sort by activation * max(weight, 0) for predicted class
-                # This shows which prototypes actually contribute to the prediction
-                weights = model.last_layer.weight[pred_class, :]  # [num_prototypes]
-                contributions = cosine_act[b] * torch.clamp(weights, min=0)
+                # Sort by activation * max(weight, 0) GLOBALLY (across all classes)
+                # This shows which prototypes contribute most to ANY class prediction
+                # Get max weight across all classes for each prototype
+                all_weights = model.last_layer.weight  # [num_classes, num_prototypes]
+                max_weights = torch.clamp(all_weights, min=0).max(dim=0)[0]  # [num_prototypes] - max across classes
+                contributions = cosine_act[b] * max_weights
                 
                 # Filter to only prototypes with POSITIVE contribution
                 positive_mask = contributions > 0
@@ -137,6 +139,7 @@ def get_top_k_prototypes_batch(model, image_batch, k=10, precomputed_outputs=Non
                     print(f"Warning: No prototypes with positive contribution for class {pred_class}")
             elif sort_by == 'weight':
                 # Sort by weight only for predicted class (what model considers important for this class)
+                # This shows prototypes with highest learned importance, regardless of activation
                 weights = model.last_layer.weight[pred_class, :]  # [num_prototypes]
                 
                 # Filter to only prototypes with POSITIVE weights
@@ -151,13 +154,51 @@ def get_top_k_prototypes_batch(model, image_batch, k=10, precomputed_outputs=Non
                     # No positive weights - fall back to all prototypes
                     sorted_weights, sorted_indices = torch.sort(weights, descending=True)
                     print(f"Warning: No prototypes with positive weight for class {pred_class}")
+            elif sort_by == 'predicted_class_activation':
+                # NEW: Top prototypes of PREDICTED CLASS that are activated in current sample
+                # Sort by activation * weight, but only for prototypes trained for predicted class
+                weights = model.last_layer.weight[pred_class, :]  # [num_prototypes]
+                proto_class_identity = model.prototype_class_identity  # [num_prototypes, num_classes]
+                
+                # Find prototypes trained for predicted class
+                proto_classes = proto_class_identity.argmax(dim=1)  # [num_prototypes]
+                predicted_class_mask = (proto_classes == pred_class) & (weights > 0)
+                predicted_class_indices = torch.where(predicted_class_mask)[0]
+                
+                if len(predicted_class_indices) > 0:
+                    # Compute activation * weight for these prototypes
+                    activations = cosine_act[b, predicted_class_indices]
+                    proto_weights = weights[predicted_class_indices]
+                    scores = activations * proto_weights
+                    
+                    sorted_scores, sorted_order = torch.sort(scores, descending=True)
+                    sorted_indices = predicted_class_indices[sorted_order]
+                else:
+                    # Fallback: use all with positive weights
+                    positive_mask = weights > 0
+                    positive_indices = torch.where(positive_mask)[0]
+                    if len(positive_indices) > 0:
+                        activations = cosine_act[b, positive_indices]
+                        proto_weights = weights[positive_indices]
+                        scores = activations * proto_weights
+                        sorted_scores, sorted_order = torch.sort(scores, descending=True)
+                        sorted_indices = positive_indices[sorted_order]
+                    else:
+                        sorted_act, sorted_indices = torch.sort(cosine_act[b], descending=True)
+                        print(f"Warning: No prototypes with positive weight for class {pred_class}")
             else:
                 # Sort by activation only (default)
                 # cosine_act[b] shape: [num_prototypes] (e.g., 2000)
                 sorted_act, sorted_indices = torch.sort(cosine_act[b], descending=True)
             
             results = []
-            num_to_show = min(k, len(sorted_indices))
+            # If k is None, return ALL prototypes (for later sorting by weight)
+            # Otherwise return top-k
+            if k is None:
+                num_to_show = len(sorted_indices)
+            else:
+                num_to_show = min(k, len(sorted_indices))
+            
             for i in range(num_to_show):
                 # Ensure we have a scalar index
                 proto_idx_tensor = sorted_indices[i]
@@ -181,7 +222,13 @@ def get_top_k_prototypes_batch(model, image_batch, k=10, precomputed_outputs=Non
                 connection_weight = model.last_layer.weight[pred_class, proto_idx].item()
                 
                 # Compute contribution score for this prototype
-                contribution = activation * max(0, connection_weight)
+                # For contribution, use max weight across all classes (global)
+                if sort_by == 'contribution':
+                    all_weights = model.last_layer.weight  # [num_classes, num_prototypes]
+                    max_weight = torch.clamp(all_weights, min=0).max(dim=0)[0][proto_idx].item()
+                    contribution = activation * max_weight
+                else:
+                    contribution = activation * max(0, connection_weight)
                 
                 # Get patch locations and slots
                 proto_slots = slots[proto_idx].cpu().numpy() # [n_subpatches]
@@ -215,7 +262,7 @@ def get_top_k_prototypes(model, image_tensor, k=10, sort_by='activation'):
     Get the top-k most activated prototypes for an image.
     
     Args:
-        sort_by: 'activation' (default), 'contribution' (activation * max(weight, 0)), or 'weight' (weight only)
+        sort_by: 'activation' (default), 'contribution' (activation * max(weight, 0)), 'weight' (weight only), or 'predicted_class_activation' (activation * weight for predicted class prototypes)
     
     Returns:
         List of dicts with keys: 'proto_idx', 'activation', 'class', 'connection_weight', 
@@ -246,9 +293,12 @@ def get_top_k_prototypes(model, image_tensor, k=10, sort_by='activation'):
         
         # Compute sorting criterion
         if sort_by == 'contribution':
-            # Sort by activation * max(weight, 0) for predicted class
-            weights = model.last_layer.weight[pred_class, :]  # [num_prototypes]
-            contributions = cosine_act[0] * torch.clamp(weights, min=0)
+            # Sort by activation * max(weight, 0) GLOBALLY (across all classes)
+            # This shows which prototypes contribute most to ANY class prediction
+            # Get max weight across all classes for each prototype
+            all_weights = model.last_layer.weight  # [num_classes, num_prototypes]
+            max_weights = torch.clamp(all_weights, min=0).max(dim=0)[0]  # [num_prototypes] - max across classes
+            contributions = cosine_act[0] * max_weights
             
             # Filter to only prototypes with POSITIVE contribution
             positive_mask = contributions > 0
@@ -263,7 +313,8 @@ def get_top_k_prototypes(model, image_tensor, k=10, sort_by='activation'):
                 sorted_contrib, sorted_indices = torch.sort(contributions, descending=True)
                 print(f"Warning: No prototypes with positive contribution for class {pred_class}")
         elif sort_by == 'weight':
-            # Sort by weight only for predicted class
+            # Sort by weight only for predicted class (regardless of activation in this image)
+            # This shows what the model considers important for this class
             weights = model.last_layer.weight[pred_class, :]  # [num_prototypes]
             
             # Filter to only prototypes with POSITIVE weights
@@ -278,13 +329,48 @@ def get_top_k_prototypes(model, image_tensor, k=10, sort_by='activation'):
                 # No positive weights - fall back to all prototypes
                 sorted_weights, sorted_indices = torch.sort(weights, descending=True)
                 print(f"Warning: No prototypes with positive weight for class {pred_class}")
+        elif sort_by == 'predicted_class_activation':
+            # NEW: Top prototypes of PREDICTED CLASS that are activated in current sample
+            # Sort by activation * weight, but only for prototypes trained for predicted class
+            weights = model.last_layer.weight[pred_class, :]  # [num_prototypes]
+            proto_class_identity = model.prototype_class_identity  # [num_prototypes, num_classes]
+            
+            # Find prototypes trained for predicted class
+            proto_classes = proto_class_identity.argmax(dim=1)  # [num_prototypes]
+            predicted_class_mask = (proto_classes == pred_class) & (weights > 0)
+            predicted_class_indices = torch.where(predicted_class_mask)[0]
+            
+            if len(predicted_class_indices) > 0:
+                # Compute activation * weight for these prototypes
+                activations = cosine_act[0, predicted_class_indices]
+                proto_weights = weights[predicted_class_indices]
+                scores = activations * proto_weights
+                
+                sorted_scores, sorted_order = torch.sort(scores, descending=True)
+                sorted_indices = predicted_class_indices[sorted_order]
+            else:
+                # Fallback: use all with positive weights
+                positive_mask = weights > 0
+                positive_indices = torch.where(positive_mask)[0]
+                if len(positive_indices) > 0:
+                    activations = cosine_act[0, positive_indices]
+                    proto_weights = weights[positive_indices]
+                    scores = activations * proto_weights
+                    sorted_scores, sorted_order = torch.sort(scores, descending=True)
+                    sorted_indices = positive_indices[sorted_order]
+                else:
+                    sorted_act, sorted_indices = torch.sort(cosine_act[0], descending=True)
+                    print(f"Warning: No prototypes with positive weight for class {pred_class}")
         else:
             # Sort by activation
             sorted_act, sorted_indices = torch.sort(cosine_act[0], descending=True)
         
-        # Get top-k
+        # Get top-k (or all if k is None)
         results = []
-        num_to_show = min(k, len(sorted_indices))
+        if k is None:
+            num_to_show = len(sorted_indices)
+        else:
+            num_to_show = min(k, len(sorted_indices))
         for i in range(num_to_show):
             proto_idx = sorted_indices[i].item()
             
@@ -298,7 +384,15 @@ def get_top_k_prototypes(model, image_tensor, k=10, sort_by='activation'):
             connection_weight = model.last_layer.weight[pred_class, proto_idx].item()
             
             # Compute contribution score
-            contribution = activation * max(0, connection_weight)
+            # For contribution, use max weight across all classes (global)
+            # Always compute both for flexibility
+            all_weights = model.last_layer.weight  # [num_classes, num_prototypes]
+            max_weight_global = torch.clamp(all_weights, min=0).max(dim=0)[0][proto_idx].item()
+            contribution_global = activation * max_weight_global
+            contribution_class = activation * max(0, connection_weight)
+            
+            # Use global contribution if sort_by is 'contribution', otherwise use class-specific
+            contribution = contribution_global if sort_by == 'contribution' else contribution_class
             
             # Get patch locations and slots
             proto_slots = slots[proto_idx].cpu().numpy()
@@ -369,12 +463,16 @@ def draw_bounding_boxes(img_rgb, patch_locations, slots, n_p=4, img_size=224,
     return img_rgb_boxed
 
 
-def create_prototype_visualization(model, image_tensor, model_name, prototype_img_dir, top_k=10, true_class=None, precomputed_results=None, sort_by='activation'):
+def create_prototype_visualization(model, image_tensor, model_name, prototype_img_dir, top_k=10, true_class=None, precomputed_results=None, sort_by='activation', target_class=None):
     """
     Create a comprehensive visualization of prototype activations with "this looks like that".
     
     Args:
-        sort_by: 'activation' (default), 'contribution' (activation * max(weight, 0)), or 'weight' (weight only)
+        sort_by: 'activation' (default), 'contribution' (activation * max(weight, 0) globally), 'weight' (weight only), 
+                 'predicted_class_activation' (activation * weight for predicted class prototypes),
+                 'ground_truth_class_activation' (activation * weight for ground truth class prototypes),
+                 'specific_class_activation' (activation * weight for target_class prototypes)
+        target_class: Required if sort_by is 'specific_class_activation'
     
     Returns:
         fig: matplotlib figure
@@ -383,37 +481,126 @@ def create_prototype_visualization(model, image_tensor, model_name, prototype_im
     """
     if precomputed_results is not None:
         proto_results = precomputed_results['proto_results']
-        pred_class = precomputed_results['pred_class']
+        pred_class = precomputed_results['pred_class']  # Use SAME predicted class from precomputed
         
-        # Re-sort if needed (precomputed might be sorted differently)
-        if sort_by == 'contribution' and 'contribution' in proto_results[0]:
-            proto_results = sorted(proto_results, key=lambda x: x['contribution'], reverse=True)
-        elif sort_by == 'weight' and 'connection_weight' in proto_results[0]:
-            proto_results = sorted(proto_results, key=lambda x: x['connection_weight'], reverse=True)
+        # IMPORTANT: We should NOT recompute (no new forward pass) to avoid different predictions
+        # Now we have ALL prototypes saved, so we can properly filter and sort
+        
+        if sort_by == 'weight':
+            # Filter to prototypes with positive weights for predicted class, then sort by weight
+            # Get weights from the model (adapted model if it's adapted)
+            weights = model.last_layer.weight[pred_class, :].detach().cpu().numpy()
+            
+            # Filter to only those with positive weights
+            filtered_results = [p for p in proto_results if weights[p['proto_idx']] > 0]
+            
+            if len(filtered_results) > 0:
+                # Sort by weight (descending)
+                filtered_results.sort(key=lambda x: weights[x['proto_idx']], reverse=True)
+                proto_results = filtered_results[:top_k]
+            else:
+                # Fallback: use all precomputed, sorted by weight
+                proto_results = sorted(proto_results, key=lambda x: x['connection_weight'], reverse=True)[:top_k]
+                
+        elif sort_by == 'predicted_class_activation':
+            # Filter to prototypes of predicted class, then sort by contribution (activation * weight)
+            # Get weights for predicted class
+            weights = model.last_layer.weight[pred_class, :].detach().cpu().numpy()
+            filtered_results = [p for p in proto_results if p['class'] == pred_class and weights[p['proto_idx']] > 0]
+            
+            if len(filtered_results) > 0:
+                # Compute and store contribution for predicted class
+                for p in filtered_results:
+                    p['contribution'] = p['activation'] * weights[p['proto_idx']]
+                # Sort by contribution (activation * weight) for predicted class prototypes
+                filtered_results.sort(key=lambda x: x['contribution'], reverse=True)
+                proto_results = filtered_results[:top_k]
+            else:
+                # Fallback: use all precomputed
+                proto_results = proto_results[:top_k]
+        elif sort_by == 'ground_truth_class_activation':
+            # Filter to prototypes of ground truth class, then sort by contribution (activation * weight)
+            if true_class is not None:
+                # Get weights for ground truth class
+                weights = model.last_layer.weight[true_class, :].detach().cpu().numpy()
+                filtered_results = [p for p in proto_results if p['class'] == true_class and weights[p['proto_idx']] > 0]
+                
+                if len(filtered_results) > 0:
+                    # Compute and store contribution for ground truth class
+                    for p in filtered_results:
+                        p['contribution'] = p['activation'] * weights[p['proto_idx']]
+                    # Sort by contribution (activation * weight) for ground truth class
+                    filtered_results.sort(key=lambda x: x['contribution'], reverse=True)
+                    proto_results = filtered_results[:top_k]
+                else:
+                    proto_results = []
+            else:
+                proto_results = []
+        elif sort_by == 'specific_class_activation':
+            # Filter to prototypes of target_class, then sort by contribution (activation * weight)
+            if target_class is not None:
+                weights = model.last_layer.weight[target_class, :].detach().cpu().numpy()
+                filtered_results = [p for p in proto_results if p['class'] == target_class and weights[p['proto_idx']] > 0]
+                
+                if len(filtered_results) > 0:
+                    # Compute and store contribution for target class
+                    for p in filtered_results:
+                        p['contribution'] = p['activation'] * weights[p['proto_idx']]
+                    # Sort by contribution (activation * weight) for target class
+                    filtered_results.sort(key=lambda x: x['contribution'], reverse=True)
+                    proto_results = filtered_results[:top_k]
+                else:
+                    proto_results = []
+            else:
+                proto_results = []
+                
+        elif sort_by == 'contribution':
+            # Recompute contribution globally (max weight across all classes)
+            # Get max weight across all classes for each prototype
+            all_weights = model.last_layer.weight.detach().cpu().numpy()  # [num_classes, num_prototypes]
+            max_weights = np.maximum(all_weights, 0).max(axis=0)  # [num_prototypes] - max across classes
+            
+            # Recompute contribution for each prototype
+            for p in proto_results:
+                p['contribution'] = p['activation'] * max_weights[p['proto_idx']]
+            
+            # Sort by contribution (global)
+            proto_results = sorted(proto_results, key=lambda x: x['contribution'], reverse=True)[:top_k]
         elif sort_by == 'activation':
-            proto_results = sorted(proto_results, key=lambda x: x['activation'], reverse=True)
+            # Already sorted by activation, just take top-k
+            proto_results = proto_results[:top_k]
     else:
-        # Get top-k prototypes
+        # Get top-k prototypes (only when precomputed not available)
         proto_results, pred_class = get_top_k_prototypes(model, image_tensor, k=top_k, sort_by=sort_by)
     
     # Get original image
     img_rgb = save_tensor_image(image_tensor, '/tmp/temp_viz.png')
     
     # Create figure: Test image patch | Training prototype | Info
-    n_rows = min(5, top_k)
-    n_cols = 3  # Test image with boxes, Training prototype, Info
+    # For predicted_class_activation, add attention map column
+    show_attention = (sort_by == 'predicted_class_activation')
+    n_rows = min(5, len(proto_results))
+    n_cols = 4 if show_attention else 3  # Test image, Training prototype, Attention map (if applicable), Info
     
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 4 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 4 * n_rows))
     if n_rows == 1:
         axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
     
     # Title with predicted and ground truth
     if sort_by == 'contribution':
-        sort_info = " (Sorted by Contribution)"
+        sort_info = " (Sorted by Contribution: Activation × Max Weight Globally)"
     elif sort_by == 'weight':
-        sort_info = " (Sorted by Weight)"
+        sort_info = " (Sorted by Weight: Model's Learned Importance)"
+    elif sort_by == 'predicted_class_activation':
+        sort_info = " (Predicted Class Prototypes: Activation × Weight)"
+    elif sort_by == 'ground_truth_class_activation':
+        sort_info = f" (Ground Truth Class {true_class} Prototypes: Activation × Weight)"
+    elif sort_by == 'specific_class_activation':
+        sort_info = f" (Class {target_class} Prototypes: Activation × Weight)"
     else:
-        sort_info = ""
+        sort_info = " (Sorted by Activation)"
     
     if true_class is not None:
         correct = "✓" if pred_class == true_class else "✗"
@@ -429,7 +616,7 @@ def create_prototype_visualization(model, image_tensor, model_name, prototype_im
             proto = proto_results[i]
             proto_idx = proto['proto_idx']
             
-            # Left: Test image with bounding boxes (THIS)
+            # Column 0: Test image with bounding boxes (THIS)
             img_with_boxes = draw_bounding_boxes(
                 img_rgb, 
                 proto['patch_locations'], 
@@ -439,7 +626,7 @@ def create_prototype_visualization(model, image_tensor, model_name, prototype_im
             axes[i, 0].set_title(f"Top-{i+1} THIS (Test Image)", fontsize=10, fontweight='bold')
             axes[i, 0].axis('off')
             
-            # Middle: Training prototype image (LOOKS LIKE THAT)
+            # Column 1: Training prototype image (LOOKS LIKE THAT)
             proto_loaded = False
             # Try multiple locations and patterns
             possible_locations = [
@@ -480,13 +667,60 @@ def create_prototype_visualization(model, image_tensor, model_name, prototype_im
                 axes[i, 1].set_title(f"Training Prototype {proto_idx}", fontsize=10)
             axes[i, 1].axis('off')
             
-            # Right: Detailed information
-            axes[i, 2].axis('off')
+            # Column 2: Attention map (only for predicted_class_activation)
+            col_idx = 2
+            if show_attention:
+                # Create attention heatmap for this prototype
+                heatmap = np.zeros((14, 14))
+                patch_locations = proto['patch_locations']
+                slots = proto['slots']
+                
+                # Mark activated locations with activation value
+                for k in range(len(slots)):
+                    if slots[k] > 0:
+                        h_idx = patch_locations[0][k]
+                        w_idx = patch_locations[1][k]
+                        # Use contribution (activation * weight) as heatmap value
+                        contrib = proto.get('contribution', proto['activation'] * max(0, proto['connection_weight']))
+                        heatmap[h_idx, w_idx] = contrib
+                
+                # Resize heatmap to image size
+                heatmap_resized = zoom(heatmap, 224/14, order=1)
+                
+                # Overlay on test image
+                axes[i, col_idx].imshow(img_rgb)
+                axes[i, col_idx].imshow(heatmap_resized, alpha=0.6, cmap='hot', vmin=0)
+                axes[i, col_idx].set_title(f"Attention Map\n(Contribution: {proto.get('contribution', 0):.3f})", 
+                                          fontsize=10, fontweight='bold')
+                axes[i, col_idx].axis('off')
+                col_idx = 3
+            else:
+                col_idx = 2
             
-            # Add contribution info if available
+            # Last column: Detailed information
+            axes[i, col_idx].axis('off')
+            
+            # Add contribution info - always compute for class-specific visualizations
             contribution_text = ""
             if 'contribution' in proto:
                 contribution_text = f"Contribution: {proto['contribution']:.4f}\n"
+            elif sort_by in ['ground_truth_class_activation', 'specific_class_activation', 'predicted_class_activation']:
+                # Compute contribution for this specific class
+                if sort_by == 'ground_truth_class_activation' and true_class is not None:
+                    target_class = true_class
+                elif sort_by == 'specific_class_activation' and target_class is not None:
+                    target_class = target_class
+                elif sort_by == 'predicted_class_activation':
+                    target_class = pred_class
+                else:
+                    target_class = None
+                
+                if target_class is not None:
+                    weight_for_class = model.last_layer.weight[target_class, proto_idx].item()
+                    contribution = proto['activation'] * max(0, weight_for_class)
+                    # Store it in proto dict for consistency
+                    proto['contribution'] = contribution
+                    contribution_text = f"Contribution: {contribution:.4f}\n"
             
             info_text = (
                 f"Prototype {proto_idx}\n"
@@ -502,14 +736,14 @@ def create_prototype_visualization(model, image_tensor, model_name, prototype_im
                 f"matches the training\n"
                 f"prototype (THAT)"
             )
-            axes[i, 2].text(0.05, 0.5, info_text, 
+            axes[i, col_idx].text(0.05, 0.5, info_text, 
                            fontsize=11, verticalalignment='center',
                            family='monospace',
                            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
         else:
-            axes[i, 0].axis('off')
-            axes[i, 1].axis('off')
-            axes[i, 2].axis('off')
+            # Hide unused subplots
+            for j in range(n_cols):
+                axes[i, j].axis('off')
     
     plt.tight_layout()
     return fig, proto_results, pred_class
@@ -948,12 +1182,18 @@ def run_comprehensive_interpretability(
                     print(f"  {i}. Proto {p['proto_idx']} (class {p['class']}): act={p['activation']:.3f}, wt={p['connection_weight']:.3f}, contrib={p['contribution']:.3f}")
         
         # Create visualization sorted by WEIGHT only (what model considers important for this class)
+        # IMPORTANT: Use same precomputed results and same predicted class - NO recomputation
         fig_weight, proto_results_weight, pred_class_weight = create_prototype_visualization(
             model, noisy_tensor, f'{method_name} (Noisy) - By Weight for Class {pred_class}', 
             prototype_img_dir, top_k=5, true_class=true_class,
-            precomputed_results=precomputed,
+            precomputed_results=precomputed,  # Use same precomputed - ensures same prediction
             sort_by='weight'
         )
+        
+        # Verify prediction matches
+        if pred_class_weight != pred_class:
+            print(f"  ⚠ WARNING: Weight visualization prediction ({pred_class_weight}) differs from main prediction ({pred_class})")
+            print(f"    This should not happen - using precomputed results!")
         
         # Save weight-based visualization
         analysis_path_weight = os.path.join(
@@ -965,8 +1205,85 @@ def run_comprehensive_interpretability(
         
         print(f"✓ Saved weight-based: {analysis_path_weight}")
         print(f"  Shows prototypes with highest weights for class {pred_class} (model's learned importance)")
+        print(f"  Prediction: {pred_class_weight} (should match {pred_class})")
         if len(proto_results_weight) > 0:
             print(f"  Top weight: {proto_results_weight[0]['connection_weight']:.4f} (proto {proto_results_weight[0]['proto_idx']}, trained for class {proto_results_weight[0]['class']})")
+            print(f"  Activation in this image: {proto_results_weight[0]['activation']:.4f}")
+        
+        # Create visualization for predicted class prototypes that are activated
+        # Filter to only prototypes of predicted class, sorted by activation * weight
+        fig_pred_class, proto_results_pred_class, pred_class_pred_class = create_prototype_visualization(
+            model, noisy_tensor, f'{method_name} (Noisy) - Predicted Class Prototypes Activated', 
+            prototype_img_dir, top_k=5, true_class=true_class,
+            precomputed_results=precomputed,  # Use same precomputed - ensures same prediction
+            sort_by='predicted_class_activation'
+        )
+        
+        # Verify prediction matches
+        if pred_class_pred_class != pred_class:
+            print(f"  ⚠ WARNING: Pred class activation visualization prediction ({pred_class_pred_class}) differs from main prediction ({pred_class})")
+        
+        # Save predicted class activation visualization
+        analysis_path_pred_class = os.path.join(
+            image_output_dir, 
+            f'03_{method_name.replace(" ", "_")}_NOISY_analysis_PRED_CLASS_ACTIVATED.png'
+        )
+        fig_pred_class.savefig(analysis_path_pred_class, dpi=150, bbox_inches='tight')
+        plt.close(fig_pred_class)
+        
+        print(f"✓ Saved predicted class prototypes: {analysis_path_pred_class}")
+        print(f"  Shows top prototypes of class {pred_class} that are activated in this image")
+        print(f"  Prediction: {pred_class_pred_class} (should match {pred_class})")
+        if len(proto_results_pred_class) > 0:
+            top_proto = proto_results_pred_class[0]
+            num_pred_class_protos = sum(1 for p in proto_results_pred_class if p['class'] == pred_class)
+            print(f"  Prototypes of class {pred_class}: {num_pred_class_protos}/{len(proto_results_pred_class)}")
+            print(f"  Top: proto {top_proto['proto_idx']} (class {top_proto['class']}, act={top_proto['activation']:.3f}, wt={top_proto['connection_weight']:.3f}, contrib={top_proto.get('contribution', top_proto['activation']*max(0,top_proto['connection_weight'])):.3f})")
+        
+        # For Normal and EATA, also create visualizations for ground truth and predicted class separately
+        if method_name in ['Normal', 'EATA'] and true_class is not None:
+            # Ground Truth Class Prototypes
+            fig_gt_class, proto_results_gt_class, pred_class_gt_class = create_prototype_visualization(
+                model, noisy_tensor, f'{method_name} (Noisy) - Ground Truth Class {true_class} Prototypes Activated', 
+                prototype_img_dir, top_k=5, true_class=true_class,
+                precomputed_results=precomputed,
+                sort_by='ground_truth_class_activation'
+            )
+            
+            analysis_path_gt_class = os.path.join(
+                image_output_dir, 
+                f'03_{method_name.replace(" ", "_")}_NOISY_analysis_GT_CLASS_{true_class}_ACTIVATED.png'
+            )
+            fig_gt_class.savefig(analysis_path_gt_class, dpi=150, bbox_inches='tight')
+            plt.close(fig_gt_class)
+            
+            print(f"✓ Saved ground truth class prototypes: {analysis_path_gt_class}")
+            print(f"  Shows top prototypes of GROUND TRUTH class {true_class} that are activated")
+            if len(proto_results_gt_class) > 0:
+                top_proto_gt = proto_results_gt_class[0]
+                print(f"  Top: proto {top_proto_gt['proto_idx']} (class {top_proto_gt['class']}, act={top_proto_gt['activation']:.3f}, wt={top_proto_gt['connection_weight']:.3f})")
+            
+            # Predicted Class Prototypes (separate from the one above, this one is simpler)
+            fig_pred_class_simple, proto_results_pred_class_simple, pred_class_pred_class_simple = create_prototype_visualization(
+                model, noisy_tensor, f'{method_name} (Noisy) - Predicted Class {pred_class} Prototypes Activated', 
+                prototype_img_dir, top_k=5, true_class=true_class,
+                precomputed_results=precomputed,
+                sort_by='specific_class_activation',
+                target_class=pred_class
+            )
+            
+            analysis_path_pred_class_simple = os.path.join(
+                image_output_dir, 
+                f'03_{method_name.replace(" ", "_")}_NOISY_analysis_PRED_CLASS_{pred_class}_ACTIVATED.png'
+            )
+            fig_pred_class_simple.savefig(analysis_path_pred_class_simple, dpi=150, bbox_inches='tight')
+            plt.close(fig_pred_class_simple)
+            
+            print(f"✓ Saved predicted class prototypes (simple): {analysis_path_pred_class_simple}")
+            print(f"  Shows top prototypes of PREDICTED class {pred_class} that are activated")
+            if len(proto_results_pred_class_simple) > 0:
+                top_proto_pred = proto_results_pred_class_simple[0]
+                print(f"  Top: proto {top_proto_pred['proto_idx']} (class {top_proto_pred['class']}, act={top_proto_pred['activation']:.3f}, wt={top_proto_pred['connection_weight']:.3f})")
         
         all_proto_results[method_name] = proto_results
     
