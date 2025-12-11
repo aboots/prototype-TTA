@@ -29,6 +29,7 @@ from collections import defaultdict
 import local_analysis
 from log import create_logger
 import re
+import interpretability_viz
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -453,21 +454,33 @@ def parse_modes(mode_arg: str):
     selected = modes & valid
     return selected or valid
 
-def evaluate_model(model, loader, description="Inference", track_per_batch=False):
+def evaluate_model(model, loader, description="Inference", track_per_batch=False, store_predictions=False, store_proto_details=False):
     """Helper to run evaluation loop.
     
     Args:
         track_per_batch: If True, returns per-batch accuracies for visualization
+        store_predictions: If True, stores all predictions and labels for later analysis
+        store_proto_details: If True, stores top-k prototype details for all samples (heavy!)
     """
     print(f'\nStarting {description}...')
     class_specific = True 
     
-    if track_per_batch:
+    # Check if we can store details
+    if store_proto_details:
+        import interpretability_viz
+    
+    if track_per_batch or store_predictions or store_proto_details:
         # Custom evaluation with per-batch tracking
         model.eval()
         batch_accuracies = []
         n_examples = 0
         n_correct = 0
+        
+        # Storage for predictions (if requested)
+        all_predictions = [] if store_predictions else None
+        all_labels = [] if store_predictions else None
+        all_indices = [] if store_predictions else None
+        all_proto_details = [] if store_proto_details else None # List of lists of dicts
         
         with torch.no_grad():
             for batch_idx, (images, labels) in enumerate(loader):
@@ -476,6 +489,31 @@ def evaluate_model(model, loader, description="Inference", track_per_batch=False
                 
                 # Forward pass
                 outputs = model(images)
+                
+                # Capture prototype details immediately after forward pass (while model state is fresh)
+                if store_proto_details:
+                    # Extract underlying PPNet
+                    if hasattr(model, 'model'):
+                        ppnet = model.model
+                    else:
+                        ppnet = model
+                    
+                    # IMPORTANT: Pass precomputed outputs to avoid calling model twice (which would cause double adaptation)
+                    # outputs could be tuple (logits, min_distances, values) or just logits
+                    if isinstance(outputs, tuple) and len(outputs) == 3:
+                        precomputed = outputs  # Already in correct format
+                    else:
+                        precomputed = None  # Would need another forward pass, but this shouldn't happen for PPNet
+                    
+                    # Use batch version to preserve batch statistics (crucial for TTA methods)
+                    # Sort by activation (default) - we'll re-sort for contribution view later if needed
+                    batch_details_list = interpretability_viz.get_top_k_prototypes_batch(ppnet, images, k=10, precomputed_outputs=precomputed, sort_by='activation')
+                    
+                    batch_details = []
+                    for results, pred_cls in batch_details_list:
+                        batch_details.append({'proto_results': results, 'pred_class': pred_cls})
+                    
+                    all_proto_details.extend(batch_details)
                 
                 # Get predictions - handle both tuple and single output
                 if isinstance(outputs, tuple):
@@ -486,8 +524,18 @@ def evaluate_model(model, loader, description="Inference", track_per_batch=False
                 _, predicted = logits.max(1)
                 batch_correct = predicted.eq(labels).sum().item()
                 batch_size = labels.size(0)
-                batch_acc = batch_correct / batch_size
-                batch_accuracies.append(batch_acc)
+                
+                if track_per_batch:
+                    batch_acc = batch_correct / batch_size
+                    batch_accuracies.append(batch_acc)
+                
+                if store_predictions:
+                    all_predictions.append(predicted.cpu())
+                    all_labels.append(labels.cpu())
+                    # Store global indices
+                    start_idx = batch_idx * loader.batch_size
+                    batch_indices = torch.arange(start_idx, start_idx + batch_size)
+                    all_indices.append(batch_indices)
                 
                 n_correct += batch_correct
                 n_examples += batch_size
@@ -497,7 +545,28 @@ def evaluate_model(model, loader, description="Inference", track_per_batch=False
         print(f'{description} Complete.')
         print(f'Final Accuracy: {accu*100:.2f}%')
         print('-' * 20)
-        return accu, batch_accuracies
+        
+        ret_val = [accu]
+        if track_per_batch:
+            ret_val.append(batch_accuracies)
+        
+        if store_predictions:
+            all_predictions = torch.cat(all_predictions)
+            all_labels = torch.cat(all_labels)
+            all_indices = torch.cat(all_indices)
+            predictions_dict = {
+                'predictions': all_predictions,
+                'labels': all_labels,
+                'indices': all_indices
+            }
+            ret_val.append(predictions_dict)
+            
+        if store_proto_details:
+            ret_val.append(all_proto_details)
+            
+        if len(ret_val) == 1:
+            return ret_val[0]
+        return tuple(ret_val)
     else:
         accu, test_loss_dict = tnt.test(model=model, dataloader=loader,
                                         class_specific=class_specific, log=print, 
@@ -517,7 +586,8 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                          adaptation_mode='layernorm_only',
                          use_ensemble_entropy=False,
                          use_source_stats=False, alpha_source_kl=0.0, num_source_samples=500,
-                         interpretability_images=None, interpretability_num_images=3):
+                         interpretability_images=None, interpretability_num_images=0,
+                         interpretability_mode='random'):
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f'Using GPU: {os.environ["CUDA_VISIBLE_DEVICES"]}')
@@ -532,16 +602,19 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
     
     # Determine which images to analyze for interpretability
     image_paths_to_analyze = []
+    smart_samples = None  # Will store (path, true_class) tuples if using smart selection
+    
     if interpretability_enabled:
         if interpretability_images:
             # Use provided image paths
             image_paths_to_analyze = interpretability_images if isinstance(interpretability_images, list) else [interpretability_images]
         else:
-            # Select random images from test dataset
-            # We'll do this after loading the dataset
+            # Will select images after model evaluation (smart or random)
             pass
 
     # Data loading
+    using_pre_generated_images = False
+    
     if corruption:
         # Check if pre-generated corrupted dataset exists
         corrupted_data_dir = Path('./datasets/cub200_c')
@@ -556,6 +629,7 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                 transforms.Normalize(mean=mean, std=std)
             ])
             test_dataset = datasets.ImageFolder(str(corruption_path), transform)
+            using_pre_generated_images = True
         else:
             if use_pre_generated:
                 print(f'Pre-generated corrupted images not found at {corruption_path}')
@@ -575,35 +649,20 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
 
     print(f'Test set size: {len(test_loader.dataset)}')
     
-    # Select random images for interpretability if needed
-    # Always use clean test_dir for interpretability (images will be analyzed in adapted model state)
-    if interpretability_enabled and not image_paths_to_analyze:
-        # Load clean test dataset to get image paths
-        transform_clean = transforms.Compose([
-            transforms.Resize(size=(img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
-        ])
-        clean_test_dataset = datasets.ImageFolder(test_dir, transform_clean)
-        
-        # Get random samples from clean test dataset
-        dataset_size = len(clean_test_dataset)
-        num_to_select = min(interpretability_num_images, dataset_size)
-        selected_indices = np.random.choice(dataset_size, size=num_to_select, replace=False)
-        
-        # Get image paths from clean dataset
-        for idx in selected_indices:
-            img_path, _ = clean_test_dataset.samples[idx]
-            # Convert to relative path from test_dir
-            rel_path = os.path.relpath(img_path, test_dir)
-            image_paths_to_analyze.append(rel_path)
-        
-        print(f'Selected {len(image_paths_to_analyze)} images for interpretability analysis (from clean test set):')
-        for img_path in image_paths_to_analyze:
-            print(f'  - {img_path}')
+    # We'll select samples AFTER running all methods if using smart selection
+    # (need model predictions first)
     
     results = {}
     results_with_batches = {}  # Store per-batch data for plotting
+    
+    # Store model wrappers for interpretability
+    models_for_interpretability = {}
+    
+    # Store predictions for smart sample selection (without re-running inference)
+    predictions_storage = {}
+    
+    # Store detailed prototype info for later visualization (avoids re-inference issues)
+    detailed_proto_storage = {}
     
     # --- Compute Source Prototype Statistics (if requested) ---
     source_proto_stats = None
@@ -674,25 +733,42 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         base_model = base_model.to(device)
         base_model.eval()
 
-        acc, batch_accs = evaluate_model(base_model, test_loader, 
-                                         description="Normal Inference (No Adaptation)",
-                                         track_per_batch=True)
+        # Store predictions if we need them for smart selection
+        if interpretability_enabled:
+            # For interpretability, we now ALWAYS capture proto details during the first pass
+            # This ensures we visualize exactly what happened during inference
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                base_model, test_loader, 
+                description="Normal Inference (No Adaptation)",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['Normal'] = preds_dict
+            detailed_proto_storage['Normal'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(
+                base_model, test_loader, 
+                description="Normal Inference (No Adaptation)",
+                track_per_batch=True
+            )
+        
         results['Normal'] = acc
         results_with_batches['Normal'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
         
-        # Run interpretability analysis
-        if interpretability_enabled:
-            run_interpretability_analysis(
-                base_model, 'Normal', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
+        # Run interpretability analysis (Legacy local analysis, not the comprehensive one)
+        # if interpretability_enabled:
+        #    run_interpretability_analysis(...)
         
-        # Clean up to free memory
-        del base_model
-        torch.cuda.empty_cache()
+        # Clean up to free memory (unless we keep it for legacy local analysis, but we are using precomputed now)
+        if interpretability_enabled:
+             models_for_interpretability['Normal'] = base_model
+        else:
+             del base_model
+             torch.cuda.empty_cache()
 
     # --- TENT INFERENCE ---
     if run_tent:
@@ -708,25 +784,33 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up Tent adaptation...")
         tent_model = setup_tent(base_model)
         
-        acc, batch_accs = evaluate_model(tent_model, test_loader, 
-                                         description="Tent Adaptation Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                tent_model, test_loader, 
+                description="Tent Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['Tent'] = preds_dict
+            detailed_proto_storage['Tent'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(tent_model, test_loader, 
+                                            description="Tent Adaptation Inference",
+                                            track_per_batch=True)
+            
         results['Tent'] = acc
         results_with_batches['Tent'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
         
-        # Run interpretability analysis
         if interpretability_enabled:
-            run_interpretability_analysis(
-                tent_model, 'Tent', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
+             models_for_interpretability['Tent'] = tent_model
         
         # Clean up
-        del tent_model
-        torch.cuda.empty_cache()
+        # del tent_model
+        # torch.cuda.empty_cache()
 
     # --- PROTO ENTROPY INFERENCE ---
     if run_proto:
@@ -758,9 +842,21 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
         
-        acc, batch_accs = evaluate_model(proto_model, test_loader, 
-                                         description="ProtoEntropy Adaptation Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                proto_model, test_loader, 
+                description="ProtoEntropy Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['ProtoEntropy'] = preds_dict
+            detailed_proto_storage['ProtoEntropy'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                            description="ProtoEntropy Adaptation Inference",
+                                            track_per_batch=True)
+            
         results['ProtoEntropy'] = acc
         results_with_batches['ProtoEntropy'] = {
             'accuracy': acc,
@@ -771,16 +867,12 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             geo_stats = proto_model.get_geo_filter_stats()
             results_with_batches['ProtoEntropy']['geo_stats'] = geo_stats
 
-        # Run interpretability analysis
         if interpretability_enabled:
-            run_interpretability_analysis(
-                proto_model, 'ProtoEntropy', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
+             models_for_interpretability['ProtoEntropy'] = proto_model
 
         # Clean up
-        del proto_model
-        torch.cuda.empty_cache()
+        # del proto_model
+        # torch.cuda.empty_cache()
 
     # --- PROTO ENTROPY with IMPORTANCE WEIGHTING ---
     if run_proto_importance:
@@ -812,9 +904,21 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
         
-        acc, batch_accs = evaluate_model(proto_model, test_loader, 
-                                         description="ProtoEntropy (Importance-Weighted) Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                proto_model, test_loader, 
+                description="ProtoEntropy (Importance-Weighted) Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['ProtoEntropy-Importance'] = preds_dict
+            detailed_proto_storage['ProtoEntropy-Importance'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                            description="ProtoEntropy (Importance-Weighted) Inference",
+                                            track_per_batch=True)
+            
         results['ProtoEntropy-Importance'] = acc
         results_with_batches['ProtoEntropy-Importance'] = {
             'accuracy': acc,
@@ -825,16 +929,12 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             geo_stats = proto_model.get_geo_filter_stats()
             results_with_batches['ProtoEntropy-Importance']['geo_stats'] = geo_stats
 
-        # Run interpretability analysis
         if interpretability_enabled:
-            run_interpretability_analysis(
-                proto_model, 'ProtoEntropy-Importance', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
+             models_for_interpretability['ProtoEntropy-Importance'] = proto_model
 
         # Clean up
-        del proto_model
-        torch.cuda.empty_cache()
+        # del proto_model
+        # torch.cuda.empty_cache()
 
     # --- PROTO ENTROPY with CONFIDENCE WEIGHTING ---
     if run_proto_confidence:
@@ -866,9 +966,21 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
         
-        acc, batch_accs = evaluate_model(proto_model, test_loader, 
-                                         description="ProtoEntropy (Confidence-Weighted) Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                proto_model, test_loader, 
+                description="ProtoEntropy (Confidence-Weighted) Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['ProtoEntropy-Confidence'] = preds_dict
+            detailed_proto_storage['ProtoEntropy-Confidence'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(proto_model, test_loader, 
+                                            description="ProtoEntropy (Confidence-Weighted) Inference",
+                                            track_per_batch=True)
+            
         results['ProtoEntropy-Confidence'] = acc
         results_with_batches['ProtoEntropy-Confidence'] = {
             'accuracy': acc,
@@ -879,16 +991,12 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             geo_stats = proto_model.get_geo_filter_stats()
             results_with_batches['ProtoEntropy-Confidence']['geo_stats'] = geo_stats
 
-        # Run interpretability analysis
         if interpretability_enabled:
-            run_interpretability_analysis(
-                proto_model, 'ProtoEntropy-Confidence', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
+             models_for_interpretability['ProtoEntropy-Confidence'] = proto_model
 
         # Clean up
-        del proto_model
-        torch.cuda.empty_cache()
+        # del proto_model
+        # torch.cuda.empty_cache()
 
     # --- PROTO ENTROPY with IMPORTANCE+CONFIDENCE WEIGHTING ---
     if run_proto_importance_confidence:
@@ -921,9 +1029,24 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         if hasattr(proto_model, 'reset_geo_filter_stats'):
             proto_model.reset_geo_filter_stats()
         
-        acc, batch_accs = evaluate_model(proto_model, test_loader, 
-                                         description="ProtoEntropy (Importance+Confidence-Weighted) Inference",
-                                         track_per_batch=True)
+        # Store predictions if we need them for smart selection
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                proto_model, test_loader, 
+                description="ProtoEntropy (Importance+Confidence-Weighted) Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['ProtoEntropy-Imp+Conf'] = preds_dict
+            detailed_proto_storage['ProtoEntropy-Imp+Conf'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(
+                proto_model, test_loader, 
+                description="ProtoEntropy (Importance+Confidence-Weighted) Inference",
+                track_per_batch=True
+            )
+        
         results['ProtoEntropy-Imp+Conf'] = acc
         results_with_batches['ProtoEntropy-Imp+Conf'] = {
             'accuracy': acc,
@@ -944,16 +1067,12 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
                 print(f"Threshold used: {geo_filter_threshold}")
             print("-" * 50)
 
-        # Run interpretability analysis
         if interpretability_enabled:
-            run_interpretability_analysis(
-                proto_model, 'ProtoEntropy-Imp+Conf', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
-
+            models_for_interpretability['ProtoEntropy-Imp+Conf'] = proto_model
+        
         # Clean up
-        del proto_model
-        torch.cuda.empty_cache()
+        # del proto_model
+        # torch.cuda.empty_cache()
 
     # --- PROTO ENTROPY+EATA INFERENCE ---
     if run_proto_eata:
@@ -969,18 +1088,33 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print(f"Setting up ProtoEntropy+EATA adaptation (threshold={proto_threshold})...")
         proto_eata_model = setup_proto_entropy_eata(base_model, entropy_threshold=proto_threshold)
 
-        acc, batch_accs = evaluate_model(proto_eata_model, test_loader, 
-                                         description="ProtoEntropy+EATA Adaptation Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                proto_eata_model, test_loader, 
+                description="ProtoEntropy+EATA Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['ProtoEntropy+EATA'] = preds_dict
+            detailed_proto_storage['ProtoEntropy+EATA'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(proto_eata_model, test_loader, 
+                                            description="ProtoEntropy+EATA Adaptation Inference",
+                                            track_per_batch=True)
+            
         results['ProtoEntropy+EATA'] = acc
         results_with_batches['ProtoEntropy+EATA'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
 
+        if interpretability_enabled:
+             models_for_interpretability['ProtoEntropy+EATA'] = proto_eata_model
+
         # Clean up
-        del proto_eata_model
-        torch.cuda.empty_cache()
+        # del proto_eata_model
+        # torch.cuda.empty_cache()
 
     # --- LOSS ADAPT INFERENCE ---
     if run_loss:
@@ -994,17 +1128,32 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up Loss Adapt adaptation...")
         loss_model = setup_loss_adapt(base_model)
         
-        acc, batch_accs = evaluate_model(loss_model, test_loader, 
-                                         description="Loss Adapt Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                loss_model, test_loader, 
+                description="Loss Adapt Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['LossAdapt'] = preds_dict
+            detailed_proto_storage['LossAdapt'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(loss_model, test_loader, 
+                                            description="Loss Adapt Inference",
+                                            track_per_batch=True)
+            
         results['LossAdapt'] = acc
         results_with_batches['LossAdapt'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
         
-        del loss_model
-        torch.cuda.empty_cache()
+        if interpretability_enabled:
+             models_for_interpretability['LossAdapt'] = loss_model
+        
+        # del loss_model
+        # torch.cuda.empty_cache()
 
     # --- FISHER-PROTO INFERENCE ---
     if run_fisher:
@@ -1020,18 +1169,33 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up Fisher-guided Proto adaptation...")
         fisher_model = setup_fisher_proto(base_model)
 
-        acc, batch_accs = evaluate_model(fisher_model, test_loader, 
-                                         description="FisherProto Adaptation Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                fisher_model, test_loader, 
+                description="FisherProto Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['FisherProto'] = preds_dict
+            detailed_proto_storage['FisherProto'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(fisher_model, test_loader, 
+                                            description="FisherProto Adaptation Inference",
+                                            track_per_batch=True)
+            
         results['FisherProto'] = acc
         results_with_batches['FisherProto'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
 
+        if interpretability_enabled:
+             models_for_interpretability['FisherProto'] = fisher_model
+
         # Clean up
-        del fisher_model
-        torch.cuda.empty_cache()
+        # del fisher_model
+        # torch.cuda.empty_cache()
 
     # --- EATA INFERENCE ---
     if run_eata:
@@ -1075,25 +1239,38 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up EATA adaptation...")
         eata_model = setup_eata(base_model, fishers)
 
-        acc, batch_accs = evaluate_model(eata_model, test_loader, 
-                                         description="EATA Adaptation Inference",
-                                         track_per_batch=True)
+        # Store predictions if we need them for smart selection
+        if interpretability_enabled:
+            # Always capture prediction and details
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                eata_model, test_loader, 
+                description="EATA Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['EATA'] = preds_dict
+            detailed_proto_storage['EATA'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(
+                eata_model, test_loader, 
+                description="EATA Adaptation Inference",
+                track_per_batch=True
+            )
+        
         results['EATA'] = acc
         results_with_batches['EATA'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
 
-        # Run interpretability analysis
+        # Store for interpretability
         if interpretability_enabled:
-            run_interpretability_analysis(
-                eata_model, 'EATA', image_paths_to_analyze,
-                model_path, test_dir, output_dir, corruption_str
-            )
-
+            models_for_interpretability['EATA'] = eata_model
+        
         # Clean up
-        del eata_model
-        torch.cuda.empty_cache()
+        # del eata_model
+        # torch.cuda.empty_cache()
 
     # --- SAR INFERENCE ---
     if run_sar:
@@ -1109,18 +1286,33 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
         print("Setting up SAR adaptation...")
         sar_model = setup_sar(base_model)
 
-        acc, batch_accs = evaluate_model(sar_model, test_loader, 
-                                         description="SAR Adaptation Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                sar_model, test_loader, 
+                description="SAR Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['SAR'] = preds_dict
+            detailed_proto_storage['SAR'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(sar_model, test_loader, 
+                                            description="SAR Adaptation Inference",
+                                            track_per_batch=True)
+            
         results['SAR'] = acc
         results_with_batches['SAR'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
 
+        if interpretability_enabled:
+             models_for_interpretability['SAR'] = sar_model
+
         # Clean up
-        del sar_model
-        torch.cuda.empty_cache()
+        # del sar_model
+        # torch.cuda.empty_cache()
 
     # --- MEMO INFERENCE ---
     if run_memo:
@@ -1141,19 +1333,181 @@ def run_unified_inference(model_path, gpu_id='0', corruption=None, severity=1, m
             test_dataset, batch_size=1, shuffle=False,
             num_workers=4, pin_memory=False)
 
-        acc, batch_accs = evaluate_model(memo_model, memo_loader, 
-                                         description="MEMO Adaptation Inference",
-                                         track_per_batch=True)
+        if interpretability_enabled:
+            acc, batch_accs, preds_dict, proto_details = evaluate_model(
+                memo_model, memo_loader, 
+                description="MEMO Adaptation Inference",
+                track_per_batch=True,
+                store_predictions=True,
+                store_proto_details=True
+            )
+            predictions_storage['MEMO'] = preds_dict
+            detailed_proto_storage['MEMO'] = proto_details
+        else:
+            acc, batch_accs = evaluate_model(memo_model, memo_loader, 
+                                            description="MEMO Adaptation Inference",
+                                            track_per_batch=True)
+            
         results['MEMO'] = acc
         results_with_batches['MEMO'] = {
             'accuracy': acc,
             'batch_accuracies': batch_accs
         }
 
-        # Clean up
-        del memo_model
-        torch.cuda.empty_cache()
+        if interpretability_enabled:
+             models_for_interpretability['MEMO'] = memo_model
 
+        # Clean up
+        # del memo_model
+        # torch.cuda.empty_cache()
+
+    # --- RUN COMPREHENSIVE INTERPRETABILITY ANALYSIS ---
+    if interpretability_enabled and models_for_interpretability:
+        print(f"\n{'='*60}")
+        print("RUNNING COMPREHENSIVE INTERPRETABILITY ANALYSIS")
+        print(f"{'='*60}")
+        
+        # Smart sample selection if requested
+        if not image_paths_to_analyze and interpretability_mode == 'proto_wins':
+            print(f"\n>>> Using SMART selection: ProtoEntropy correct, Normal AND EATA both wrong")
+            print(f">>> Using PRE-STORED predictions from evaluation phase (no re-inference)...")
+            
+            # Check if we have all required predictions
+            if all(k in predictions_storage for k in ['Normal', 'EATA', 'ProtoEntropy-Imp+Conf']):
+                smart_samples = interpretability_viz.select_smart_samples_from_predictions(
+                    predictions_storage=predictions_storage,
+                    test_dataset=test_loader.dataset,
+                    num_samples=interpretability_num_images
+                )
+            else:
+                print(f"⚠ Missing stored predictions. Available: {list(predictions_storage.keys())}")
+                print(f"  Cannot perform smart selection. Falling back to random.")
+                smart_samples = None
+            
+            if smart_samples and len(smart_samples) > 0:
+                image_paths_to_analyze = smart_samples  # Already includes true classes
+                print(f"\n✓ Selected {len(smart_samples)} smart samples from diverse classes")
+                print(f"  (ProtoEntropy correct, but BOTH Normal AND EATA wrong)")
+                for path, true_class in smart_samples:
+                    print(f"  - {path} (true class: {true_class})")
+            else:
+                print(f"\n⚠ Smart selection didn't find enough samples, falling back to random...")
+        
+        # Random selection fallback
+        if not image_paths_to_analyze:
+            print(f"\n>>> Using RANDOM selection")
+            transform_clean = transforms.Compose([
+                transforms.Resize(size=(img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)
+            ])
+            clean_test_dataset = datasets.ImageFolder(test_dir, transform_clean)
+            
+            dataset_size = len(clean_test_dataset)
+            num_to_select = min(interpretability_num_images, dataset_size)
+            selected_indices = np.random.choice(dataset_size, size=num_to_select, replace=False)
+            
+            for idx in selected_indices:
+                img_path, true_class = clean_test_dataset.samples[idx]
+                rel_path = os.path.relpath(img_path, test_dir)
+                image_paths_to_analyze.append((rel_path, true_class))
+            
+            print(f'✓ Selected {len(image_paths_to_analyze)} random images')
+            for path, true_class in image_paths_to_analyze:
+                print(f'  - {path} (true class: {true_class})')
+        
+        # Determine prototype image directory
+        model_dir = os.path.dirname(model_path)
+        possible_img_dirs = [
+            os.path.join(model_dir, 'img'),
+            os.path.join(model_dir, 'prototype_imgs'),
+            os.path.join(model_dir, 'prototype-img'),
+        ]
+        prototype_img_dir = None
+        for img_dir in possible_img_dirs:
+            if os.path.exists(img_dir):
+                prototype_img_dir = img_dir
+                break
+        
+        if prototype_img_dir is None:
+            print("WARNING: Could not find prototype image directory. Skipping interpretability.")
+            print(f"  Searched in: {possible_img_dirs}")
+        else:
+            # Prepare experimental settings dict
+            experimental_settings = {
+                'model_path': model_path,
+                'corruption': corruption if corruption else 'None',
+                'severity': severity if corruption else 'N/A',
+                'modes': list(models_for_interpretability.keys()),
+                'geometric_filter': use_geometric_filter,
+                'geo_filter_threshold': geo_filter_threshold if use_geometric_filter else 'N/A',
+                'consensus_strategy': consensus_strategy,
+                'adaptation_mode': adaptation_mode,
+                'reset_mode': reset_mode,
+                'reset_frequency': reset_frequency,
+                'use_ensemble_entropy': use_ensemble_entropy,
+                'use_source_stats': use_source_stats,
+                'alpha_source_kl': alpha_source_kl if use_source_stats else 0.0,
+                'interpretability_mode': interpretability_mode,
+            }
+            
+            # Prepare batch of precomputed results for the selected images
+            # Need to map image paths to their index in the dataset to extract results
+            # image_paths_to_analyze contains (rel_path, true_class) tuples
+            
+            # Create a map from rel_path to index
+            # This requires iterating the dataset samples
+            # Since test_loader is sequential, index corresponds to dataset index
+            print("Preparing precomputed results for visualization...")
+            path_to_idx = {}
+            if hasattr(test_dataset, 'samples'):
+                for idx, (path, _) in enumerate(test_dataset.samples):
+                    rel = os.path.relpath(path, test_dataset.root)
+                    path_to_idx[rel] = idx
+            
+            batch_precomputed_results = []
+            for path, _ in image_paths_to_analyze:
+                if path in path_to_idx:
+                    idx = path_to_idx[path]
+                    
+                    # Create a dict mapping {method_name: results_dict} for this image
+                    img_results = {}
+                    for method_name, details_list in detailed_proto_storage.items():
+                         if idx < len(details_list):
+                             img_results[method_name] = details_list[idx]
+                    
+                    batch_precomputed_results.append(img_results)
+                else:
+                    print(f"⚠ Warning: Could not find index for {path}")
+                    batch_precomputed_results.append(None)
+            
+            # Run batch interpretability
+            output_dirs = interpretability_viz.run_batch_interpretability(
+                models_dict=models_for_interpretability,
+                image_paths=image_paths_to_analyze,
+                test_dir=test_dir,
+                prototype_img_dir=prototype_img_dir,
+                output_base_dir=output_dir,
+                corruption_name=corruption,
+                severity=severity,
+                experimental_settings=experimental_settings,
+                use_pre_corrupted=using_pre_generated_images,
+                data_root=test_dataset.root if hasattr(test_dataset, 'root') else test_dir,
+                batch_precomputed_results=batch_precomputed_results
+            )
+            
+            print(f"\n{'='*60}")
+            print(f"Interpretability analysis complete!")
+            print(f"Generated {len(output_dirs)} visualization sets")
+            for out_dir in output_dirs:
+                print(f"  - {out_dir}")
+            print(f"{'='*60}\n")
+        
+        # Clean up models after interpretability
+        for model_wrapper in models_for_interpretability.values():
+            del model_wrapper
+        torch.cuda.empty_cache()
+    
     # --- CREATE PLOTS ---
     if results_with_batches:
         corruption_str = f"{corruption}_sev{severity}" if corruption else "clean"
@@ -1396,8 +1750,18 @@ if __name__ == '__main__':
         '--interpretability-num-images',
         type=int,
         default=0,
-        help='Number of random images to select for interpretability analysis (default: 0 = disabled). '
+        help='Number of images to select for interpretability analysis (default: 0 = disabled). '
              'Ignored if --interpretability-images is provided.'
+    )
+    
+    parser.add_argument(
+        '--interpretability-mode',
+        type=str,
+        default='random',
+        choices=['random', 'proto_wins'],
+        help='How to select images for interpretability: '
+             'random (default) - select random images, '
+             'proto_wins - select images where ProtoEntropy is correct but EATA is wrong'
     )
     
     args = parser.parse_args()
@@ -1420,4 +1784,5 @@ if __name__ == '__main__':
                          args.consensus_strategy, args.consensus_ratio, args.adaptation_mode,
                          args.use_ensemble_entropy, args.use_source_stats, args.alpha_source_kl, 
                          args.num_source_samples,
-                         args.interpretability_images, args.interpretability_num_images)
+                         args.interpretability_images, args.interpretability_num_images,
+                         args.interpretability_mode)
