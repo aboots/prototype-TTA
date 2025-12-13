@@ -1,232 +1,343 @@
-# ProtoViT: Interpretable Image Classification with Adaptive Prototype-based Vision Transformers
+# ProtoTTA: Prototype-Aware Test-Time Adaptation
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This repository contains the official implementation of the paper ["**Interpretable Image Classification with Adaptive Prototype-based Vision Transformers**"](https://arxiv.org/abs/2410.20722). **(NeurIPS 2024)**
-
-<div align="center">
-<img src="assets/arch.jpg" width="600px">
-</div>
-
-## Table of Contents
-- [Overview](#overview)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Dataset Preparation](#dataset-preparation)
-- [Training](#training)
-- [Analysis](#analysis)
-- [Model Zoo](#model-zoo)
-- [Citation](#citation)
-- [Acknowledgments](#acknowledgments)
+**ProtoTTA** (Prototype-Aware Test-Time Adaptation) is a test-time adaptation framework specifically designed for prototype-based neural networks. Unlike standard TTA methods that rely solely on output logits, ProtoTTA leverages intermediate prototype signals to achieve more effective adaptation under distribution shifts.
 
 ## Overview
 
-ProtoViT is a novel approach that combines Vision Transformers with prototype-based learning to create interpretable image classification models. Our implementation provides both high accuracy and explainability through learned prototypes.
+ProtoTTA minimizes the binary entropy of prototype-similarity distributions, encouraging decisive and semantically meaningful activations. Key features include:
 
-## Prerequisites
-
-### Software Requirements
-
-We recommend using a conda environment with Python 3.10:
-- Python 3.10
-- CUDA-capable GPU and drivers (for GPU training)
-- PyTorch with CUDA support (for NVIDIA B200 we tested with PyTorch 2.9.0 + CUDA 12.8 wheels)
-- NumPy
-- OpenCV (cv2)
-- [Augmentor](https://github.com/mdbloice/Augmentor)
-- timm==0.4.12 (Note: higher versions may require modifications to the ViT encoder)
-
-### Hardware Requirements
-Recommended GPU configurations:
-- 1× NVIDIA Quadro RTX 6000 (24GB) or
-- 1× NVIDIA GeForce RTX 4090 (24GB) or
-- 1× NVIDIA RTX A6000 (48GB)
+- **Robust consensus aggregation**: Uses top-k mean of sub-prototypes instead of maximum to reduce sensitivity to outliers
+- **Geometric filtering**: Restricts updates to samples with reliable prototype activations
+- **Prototype-aware adaptation**: Updates attention biases and LayerNorm parameters to restore semantic focus
+- **Stability mechanisms**: Prototype-importance weighting and confidence-based regularization
 
 ## Installation
 
-We recommend the following steps to recreate a working environment.  
-For NVIDIA B200 GPUs (CUDA 12.8), we use the official PyTorch wheels with CUDA 12.8 support.
+### Prerequisites
+
+- Python 3.10+
+- CUDA-capable GPU (recommended)
+- PyTorch 2.x with CUDA support
+
+### Setup
 
 ```bash
-git clone https://github.com/Henrymachiyu/ProtoViT.git
-cd ProtoViT
+# Clone the repository
+git clone https://github.com/aboots/prototype-TTA.git
+cd prototype-TTA/ProtoViT
 
-# 1) Create and activate a conda environment (Python 3.10)
-conda create -n protovit python=3.10 -y
-conda activate protovit
+# Create conda environment
+conda create -n prototta python=3.10 -y
+conda activate prototta
 
-# 2) Install PyTorch with CUDA 12.8 (adjust according to your hardware if needed).
-# For B200 GPUs, follow the command from https://pytorch.org/get-started/locally/.
-# Example (as of writing) using official cu128 wheels:
-pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
-  --index-url https://download.pytorch.org/whl/cu128
+# Install PyTorch (adjust CUDA version as needed)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-# 3) Install all remaining Python dependencies via pip
+# Install dependencies
 pip install -r requirements.txt
+
+# Install robustness evaluation dependencies (for corruption generation)
+pip install -r robustness_requirements.txt
+
+# Note: For full corruption support, install ImageMagick system package:
+# Ubuntu/Debian: sudo apt-get install libmagickwand-dev imagemagick
+# macOS: brew install imagemagick
+# (Basic corruptions work without ImageMagick, but motion_blur and snow require it)
 ```
 
-The `requirements.txt` is a standard pip-style file and:
-- Contains the Python-level dependencies used in our experiments (e.g., timm, transformers, cleverhans, etc.).
-- Includes `cmake` and `lit`, which are required when `triton` (used by recent PyTorch versions) is installed via pip and avoids warnings such as:
-  - `triton ... requires cmake, which is not installed.`
-  - `triton ... requires lit, which is not installed.`
+## Using ProtoTTA
+
+ProtoTTA is implemented as a standalone module (`proto_entropy.py`) that can be integrated into any prototype-based model. The core class is `ProtoEntropy`, which wraps your model and performs test-time adaptation.
+
+### Model Requirements
+
+Your prototype-based model must satisfy the following interface:
+
+1. **Forward method**: `model(x)` must return a tuple `(logits, min_distances, similarities)`
+   - `logits`: [batch_size, num_classes] - classification logits
+   - `min_distances`: [batch_size, num_prototypes] - distance to each prototype
+   - `similarities`: [batch_size, num_prototypes] or [batch_size, num_prototypes, num_sub_prototypes] - similarity scores
+
+2. **Required attributes**:
+   - `model.prototype_class_identity`: [num_prototypes, num_classes] tensor mapping prototypes to classes
+   - `model.last_layer`: Classification head (required for prototype importance weighting)
+
+3. **Optional attributes** (depending on `adaptation_mode`):
+   - `model.prototype_vectors`: Prototype vectors (if adapting prototypes)
+   - `model.patch_select`: Patch selection parameters (if adapting patch selection)
+
+### Basic Integration
+
+```python
+from proto_entropy import ProtoEntropy, configure_model, collect_params
+import torch.optim as optim
+
+# 1. Configure model for adaptation
+# This enables gradients for the specified components
+model = configure_model(model, adaptation_mode='layernorm_attn_bias')
+
+# 2. Collect parameters to adapt
+params, param_names = collect_params(model, adaptation_mode='layernorm_attn_bias')
+print(f"Adapting parameters: {param_names}")
+
+# 3. Setup optimizer
+optimizer = optim.Adam(params, lr=0.001)
+
+# 4. Create ProtoTTA wrapper (using best configuration from experiments)
+proto_tta = ProtoEntropy(
+    model=model,
+    optimizer=optimizer,
+    steps=1,  # Number of adaptation steps per batch
+    use_geometric_filter=True,  # Filter unreliable samples
+    geo_filter_threshold=0.92,  # Similarity threshold for filtering
+    consensus_strategy='top_k_mean',  # How to aggregate sub-prototypes
+    use_prototype_importance=True,  # Weight by prototype importance
+    use_confidence_weighting=True,  # Weight by prediction confidence
+    use_ensemble_entropy=False,  # Best: aggregate first, then compute entropy
+    adaptation_mode='layernorm_attn_bias'  # What to adapt (best for ProtoViT)
+)
+
+# 5. During inference (ProtoTTA adapts automatically)
+logits, min_distances, similarities = proto_tta(x)
+```
+
+### Adaptation Modes
+
+The `adaptation_mode` parameter controls which model components are adapted:
+
+- `layernorm_only`: Only LayerNorm/BatchNorm parameters (safest, default)
+- `layernorm_attn_bias`: LayerNorms + Attention biases (recommended for ProtoViT)
+- `layernorm_proto`: LayerNorms + Prototype vectors
+- `layernorm_proto_patch`: LayerNorms + Prototypes + Patch selection
+- `layernorm_proto_last`: LayerNorms + Prototypes + Last layer
+- `full_proto`: Prototypes + Patch selection + Last layer (no backbone)
+- `all_adaptive`: Everything except frozen backbone features
 
 ## Dataset Preparation
 
 ### CUB-200-2011 Dataset
 
 1. Download [CUB_200_2011.tgz](http://www.vision.caltech.edu/visipedia/CUB-200-2011.html)
-2. Extract the dataset:
+2. Extract and preprocess:
    ```bash
-   #Download the dataset CUB_200_2011.tgz from http://www.vision.caltech.edu/visipedia/CUB-200-2011.html
    tar -xzf CUB_200_2011.tgz
+   # Follow dataset instructions for cropping and train/test split
+   # Place cropped images in ./datasets/cub200_cropped/
    ```
-3. Process the dataset:
-   
-   For cropping data and training_test split, please carefully follow the instructions from the dataset.
-   Sample code can be found in preprocess sample code that can crop and split data with Jupyter Notebook.
-      
+3. Augment training data:
    ```bash
-   # Create directory structure
-   mkdir -p ./datasets/cub200_cropped/{train_cropped,test_cropped}
-   
-   # Crop and split images using provided scripts
-   python your_own_scripts/crop_images.py  # Uses bounding_boxes.txt
-   python your_own_scripts/split_dataset.py  # Uses train_test_split.txt
-   #Put the cropped training images in the directory "./datasets/cub200_cropped/train_cropped/"
-   #Put the cropped test images in the directory "./datasets/cub200_cropped/test_cropped/"
-   
-   # Augment training data 
    python img_aug.py
-   #this will create an augmented training set in the following directory:
-   #"./datasets/cub200_cropped/train_cropped_augmented/"
    ```
 
-### Stanford Cars Dataset
-The official website for the dataset is: 
-- [Official Stanford Cars Dataset](https://ai.stanford.edu/~jkrause/cars/car_dataset.html)
+### Creating CUB-200-C (Corrupted Dataset)
 
-Alternative dataset option available from:
-- [Kaggle Mirror](https://www.kaggle.com/datasets/jessicali9530/stanford-cars-dataset/data)
+To evaluate robustness, create corrupted versions of the test set:
+
+```bash
+python create_cub_c.py \
+    --input_dir ./datasets/cub200_cropped/test_cropped/ \
+    --output_dir ./datasets/cub200_c/ \
+    --corruption all \
+    --severity 1,2,3,4,5
+```
+
+This creates corrupted datasets for all corruption types at specified severity levels.
 
 ## Training
 
-1. Configure settings in `settings.py`:
+1. Configure dataset paths in `settings.py`:
+   ```python
+   data_path = "./datasets/cub200_cropped/"
+   train_dir = data_path + "train_cropped_augmented/"
+   test_dir = data_path + "test_cropped/"
+   ```
 
-```python
-# Dataset paths
-data_path = "./datasets/cub200_cropped/"
-train_dir = data_path + "train_cropped_augmented/"
-test_dir = data_path + "test_cropped/"
-train_push_dir = data_path + "train_cropped/"
-```
+2. Train the model:
+   ```bash
+   python main.py
+   ```
 
-2. Start training:
-```bash
-python main.py
-```
+## Evaluation
 
-## Analysis
+### Test-Time Adaptation Inference
 
-### Parameter settings 
-
-The corresponsing parameter settings for global and local analysis are saved in the analysis_settings.py 
-```python 
-   load_model_dir = 'saved model path'#'./saved_models/vgg19/003/'
-   load_model_name = 'model_name'#'14finetuned0.9230.pth'
-   save_analysis_path = 'saved_dir_rt'
-   img_name = 'prototype_vis_file'# 'img/'
-   test_data = "test_dir"
-   check_test_acc = False
-   check_list =['list of test images'] #"163_Mercedes-Benz SL-Class Coupe 2009/03123.jpg", Could be a list of images
-```
-
-### Local Analysis and reasoning process
-
-To produce the reasoning plots: 
-<div align="center">
-<img src="assets/reasoning.jpg" width="600px">
-</div>
-
-We analyze nearest prototypes for specific test images and retrieve model reasoning process for predictions:
+Run ProtoTTA on corrupted test data:
 
 ```bash
-# this function provdes results for model's reasoning and local analysis
-
-python local_analysis.py -gpuid 0
+python run_inference.py \
+    -corruption gaussian_noise \
+    -severity 5 \
+    -mode proto_importance_confidence \
+    --use-geometric-filter \
+    --geo-filter-threshold 0.92 \
+    --consensus-strategy top_k_mean \
+    --adaptation-mode layernorm_attn_bias
 ```
 
-### Global Analysis
-To produce the global analysis plots:
+**Note:** The best configuration (achieving 60.09% mean accuracy on CUB-200-C) uses:
+- `use_ensemble_entropy=False` (aggregate sub-prototypes first, then compute entropy)
+- `use_geometric_filter=True` with `geo_filter_threshold=0.92`
+- `consensus_strategy='top_k_mean'`
+- `adaptation_mode='layernorm_attn_bias'`
 
-<div align="center">
-<img src="assets/analysis.jpg" width="600px">
-</div>
+**Key Arguments:**
+- `-mode`: Adaptation method (`normal`, `eata`, `proto_importance_confidence`, or comma-separated list)
+- `--use-geometric-filter`: Enable geometric filtering for reliable samples (recommended: True)
+- `--geo-filter-threshold`: Similarity threshold for filtering (best: 0.92)
+- `--consensus-strategy`: How to aggregate sub-prototypes (`max`, `mean`, `median`, `top_k_mean`, `weighted_mean`). Best: `top_k_mean`
+- `--adaptation-mode`: What to adapt (`layernorm_only`, `layernorm_attn_bias`, `layernorm_proto`, etc.). Best: `layernorm_attn_bias`
+- `--use-ensemble-entropy`: Use ensemble entropy across sub-prototypes (best: False - aggregate first, then compute entropy)
+- `--use-source-stats`: Use source distribution regularization (optional)
+- `--alpha-source-kl`: Weight for source KL regularization (default: 0.0, optional)
 
-This following file finds nearest patches for each prototype to ensure the prototypes are semantically consistent across samples in train and test data:
+**Example with source statistics (optional regularization):**
+```bash
+python run_inference.py \
+    -mode proto_importance_confidence \
+    -corruption gaussian_noise \
+    -severity 5 \
+    --use-geometric-filter \
+    --geo-filter-threshold 0.92 \
+    --consensus-strategy top_k_mean \
+    --adaptation-mode layernorm_attn_bias \
+    --use-source-stats \
+    --alpha-source-kl 0.005 \
+    --num-source-samples 2000
+```
+
+**Note:** Source statistics regularization is optional and can help prevent drift, but the best results (60.09% mean accuracy) were achieved without it.
+
+**Multiple methods comparison:**
+```bash
+python run_inference.py \
+    -corruption gaussian_noise \
+    -severity 5 \
+    -mode normal,eata,proto_importance_confidence \
+    --use-geometric-filter \
+    --geo-filter-threshold 0.92 \
+    --consensus-strategy top_k_mean \
+    --adaptation-mode layernorm_attn_bias
+```
+
+### Robustness Evaluation
+
+Evaluate model performance across multiple corruptions:
 
 ```bash
-python global_analysis.py -gpuid 0
+python evaluate_robustness.py \
+    --model ./saved_models/best_model.pth \
+    --data_dir ./datasets/cub200_c/ \
+    --output ./robustness_results_sev5.json
 ```
 
-## Location Misalignment 
+## Visualization and Analysis
 
-To run the experiment, you would also need cleverhans
-```bash
-pip install cleverhans
-```
-### Parameter settings 
+### Robustness Results Visualization
 
-All the parameters used for reproducing our results on location misalignment are stored in adv_settings.py 
-
-```python
-load_model_path = "."
-test_dir = "./cub200_cropped/test_cropped"
-model_output_dir = "." # dir for saving all the results 
-```
-
-To run the adversarial attack and retrieve the results
+Visualize and analyze robustness evaluation results:
 
 ```bash
-cd ./spatial_alignment_test
-python run_adv_test.py # as default, we ran experiment over entire test set
+python visualize_robustness_results.py \
+    --input robustness_results_sev5.json \
+    --output_dir ./plots/robustness_analysis \
+    --exclude saturate spatter \
+    --save_summary summary_stats.json
 ```
 
-### Model Zoo
+### Method Comparison
 
-### CUB-200-2011 Dataset Results
-We provide checkpoints after projection and last layer finetuning on CUB-200-2011 dataset. 
-| Model Version | Backbone | Resolution | Accuracy | Checkpoint |
-|--------------|----------|------------|----------|------------|
-| ProtoViT-T | DeiT-Tiny | 224×224 | 83.36% | [Download](https://huggingface.co/chiyum609/ProtoViT/blob/main/DeiT_Tiny_finetuned0.8336.pth) | 
-| ProtoViT-S | DeiT-Small | 224×224 | 85.30% | [Download](https://huggingface.co/chiyum609/ProtoViT/blob/main/DeiT_Small_finetuned0.8530.pth) | 
-| ProtoViT-CaiT | CaiT_xxs24 | 224×224 | 86.02% |  [Download](https://huggingface.co/chiyum609/ProtoViT/blob/main/CaiT_xxs24_224_finetuned0.8602.pth) |
+Compare two adaptation methods:
 
+```bash
+python compare_methods.py \
+    --input robustness_results_sev5.json \
+    --method1 eata \
+    --method2 proto_imp_conf_v3
+```
 
-## Acknowledgments
+### Ablation Studies
 
-This implementation is based on the timm, [ProtoPNet](https://github.com/cfchen-duke/ProtoPNet) repository and its variations. We thank the authors for their valuable work.
+Run ablation studies to analyze component contributions:
 
-## Contact Info
+```bash
+python run_ablation_studies.py --use_all_samples
+```
 
-If you have any questions regarding the paper or implementations, please don't hesitate to email us: chiyu.ma.gr@dartmouth.edu
+Visualize ablation results:
 
-Feel free to ⭐ the repo, contribute, or share it with others who might find it useful!
+```bash
+python visualize_robustness_results.py \
+    --input robustness_results_sev5.json \
+    --csv_input ./ablation_studies/visualizations/detailed_results.csv
+```
 
-## Citation 
+### Interpretability Visualization
 
-If you find this work helpful in your research, please also consider citing:
+Generate interpretability visualizations:
 
-```bibtex 
-@inproceedings{ma2024interpretable,
-  title={Interpretable Image Classification with Adaptive Prototype-based Vision Transformers},
-  author={Ma, Chiyu and Donnelly, Jon and Liu, Wenjun and Vosoughi, Soroush and Rudin, Cynthia and Chen, Chaofan},
-  booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems}
+```bash
+python run_inference.py \
+    -corruption gaussian_noise \
+    -severity 5 \
+    -mode proto_importance_confidence \
+    --use-geometric-filter \
+    --geo-filter-threshold 0.92 \
+    --consensus-strategy top_k_mean \
+    --adaptation-mode layernorm_attn_bias \
+    --interpretability-num-images 5 \
+    --interpretability-mode proto_wins
+```
+
+**Best Configuration Summary:**
+Based on experimental results on CUB-200-C (severity 5), the best configuration achieving **60.09% mean accuracy** (vs 51.89% baseline) is:
+- `use_geometric_filter=True`, `geo_filter_threshold=0.92`
+- `consensus_strategy='top_k_mean'`, `consensus_ratio=0.5`
+- `adaptation_mode='layernorm_attn_bias'`
+- `use_prototype_importance=True`, `use_confidence_weighting=True`
+- `use_ensemble_entropy=False` (aggregate first, then compute entropy)
+
+### Class Prototype Visualization
+
+Visualize learned class prototypes:
+
+```bash
+python visualize_class_prototypes.py
+```
+
+## Scripts Overview
+
+| Script | Purpose |
+|--------|---------|
+| `run_inference.py` | Main inference script with TTA support |
+| `evaluate_robustness.py` | Comprehensive robustness evaluation across corruptions |
+| `create_cub_c.py` | Generate corrupted CUB-200-C dataset |
+| `visualize_robustness_results.py` | Visualize and analyze robustness results |
+| `compare_methods.py` | Compare different adaptation methods |
+| `run_ablation_studies.py` | Run ablation studies |
+| `visualize_class_prototypes.py` | Visualize learned prototypes |
+| `interpretability_viz.py` | Generate interpretability visualizations |
+
+## Citation
+
+If you use ProtoTTA in your research, please cite:
+
+```bibtex
+@article{abootorabi2025prototta,
+  title={ProtoTTA: Prototype-Aware Test-Time Adaptation},
+  author={Abootorabi, Mohammad Mahdi},
+  journal={CPSC 532X: Adaptation \& Adaptive Computation},
+  year={2025}
 }
-}
 ```
+
 ## License
 
-This project is licensed under the MIT License. 
+This project is licensed under the MIT License.
+
+## Contact
+
+For questions or issues, please contact: mahdi.abootorabi@ece.ubc.ca

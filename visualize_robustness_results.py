@@ -10,6 +10,7 @@ Usage:
 import os
 import json
 import argparse
+import csv
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
@@ -37,26 +38,20 @@ CORRUPTION_CATEGORIES = {
 
 # Method display names (for better labels)
 METHOD_DISPLAY_NAMES = {
-    'normal': 'Normal',
+    'unadapted': 'Unadapted',
     'tent': 'Tent',
-    'proto_imp_conf_v1': 'Proto-Imp+Conf (v1)',
-    'proto_imp_conf_v2': 'Proto-Imp+Conf (v2)',
-    'proto_imp_conf_v3': 'Proto-Imp+Conf (v3)',
-    'loss': 'LossAdapt',
     'eata': 'EATA',
-    'sar': 'SAR'
+    'sar': 'SAR',
+    'prototta': 'ProtoTTA'
 }
 
 # Color palette for methods
 METHOD_COLORS = {
-    'normal': '#1f77b4',           # Blue
-    'tent': '#ff7f0e',              # Orange
-    'proto_imp_conf_v1': '#2ca02c', # Green
-    'proto_imp_conf_v2': '#d62728', # Red
-    'proto_imp_conf_v3': '#9467bd', # Purple
-    'loss': '#8c564b',              # Brown
-    'eata': '#e377c2',              # Pink
-    'sar': '#7f7f7f'                # Gray
+    'unadapted': '#1f77b4',           # Blue
+    'tent': '#ff7f0e',                 # Orange
+    'eata': '#e377c2',                 # Pink
+    'sar': '#7f7f7f',                  # Gray
+    'prototta': '#2ca02c'              # Green
 }
 
 
@@ -65,6 +60,74 @@ def load_results(json_file):
     with open(json_file, 'r') as f:
         data = json.load(f)
     return data
+
+
+def load_prototta_from_csv(csv_file, experiment_name, configuration, severity='5'):
+    """Load ProtoTTA results from CSV file.
+    
+    Args:
+        csv_file: Path to CSV file
+        experiment_name: Name of experiment (e.g., "Experiment 1: Consensus Strategy")
+        configuration: Configuration name (e.g., "top_k_mean")
+        severity: Severity level (default: '5')
+    
+    Returns:
+        Dictionary with corruption types as keys and accuracies as values (in decimal format)
+    """
+    results = {}
+    
+    with open(csv_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if (row['Experiment'] == experiment_name and 
+                row['Configuration'] == configuration):
+                corruption = row['Corruption']
+                # CSV has accuracy as percentage (e.g., 51.9676), convert to decimal
+                accuracy = float(row['Accuracy']) / 100.0
+                results[corruption] = {severity: accuracy}
+    
+    return results
+
+
+def merge_results(json_file, csv_file, severity='5'):
+    """Merge baseline results from JSON and ProtoTTA results from CSV.
+    
+    Args:
+        json_file: Path to JSON file with baseline results
+        csv_file: Path to CSV file with ProtoTTA results
+        severity: Severity level to extract
+    
+    Returns:
+        Dictionary with merged results in the same format as JSON results
+    """
+    # Load JSON results
+    json_data = load_results(json_file)
+    json_results = json_data['results']
+    
+    # Extract baseline methods (tent, eata, sar, normal)
+    merged_results = {}
+    
+    # Rename 'normal' to 'unadapted' and add baseline methods
+    baseline_methods = ['tent', 'eata', 'sar', 'normal']
+    for method in baseline_methods:
+        if method in json_results:
+            if method == 'normal':
+                merged_results['unadapted'] = json_results[method]
+            else:
+                merged_results[method] = json_results[method]
+    
+    # Load ProtoTTA results from CSV
+    prototta_results = load_prototta_from_csv(
+        csv_file, 
+        experiment_name='Experiment 1: Consensus Strategy',
+        configuration='top_k_mean',
+        severity=severity
+    )
+    
+    if prototta_results:
+        merged_results['prototta'] = prototta_results
+    
+    return merged_results
 
 
 def get_method_averages(results_dict, severity='5', exclude_list=None):
@@ -457,6 +520,69 @@ def print_summary_table(method_averages, category_averages, exclude_list=None):
     print("="*80)
 
 
+def print_per_corruption_table(results_dict, severity='5', exclude_list=None):
+    """Print per-corruption performance table.
+    
+    Args:
+        results_dict: Dictionary of results
+        severity: Severity level to analyze
+        exclude_list: List of corruption types to exclude (default: None)
+    """
+    if exclude_list is None:
+        exclude_list = []
+    
+    # Get all corruption types and methods
+    all_corruptions = set()
+    all_methods = list(results_dict.keys())
+    
+    for method_name, corruptions in results_dict.items():
+        all_corruptions.update(corruptions.keys())
+    
+    # Filter out excluded corruptions
+    all_corruptions = sorted([c for c in all_corruptions if c not in exclude_list])
+    
+    if not all_corruptions:
+        print("\nNo corruptions to display (all excluded).")
+        return
+    
+    print("\n" + "="*100)
+    print("PER-CORRUPTION PERFORMANCE SUMMARY")
+    print("="*100)
+    
+    # Header
+    header = f"{'Corruption':<25s}"
+    for method_name in all_methods:
+        display_name = METHOD_DISPLAY_NAMES.get(method_name, method_name)
+        # Truncate if too long
+        if len(display_name) > 12:
+            display_name = display_name[:9] + "..."
+        header += f" {display_name:>12s}"
+    print(header)
+    print("-"*100)
+    
+    # Data rows
+    for corruption in all_corruptions:
+        # Format corruption name nicely
+        corruption_display = corruption.replace('_', ' ').title()
+        if len(corruption_display) > 24:
+            corruption_display = corruption_display[:21] + "..."
+        
+        row = f"{corruption_display:<25s}"
+        for method_name in all_methods:
+            if (corruption in results_dict[method_name] and 
+                severity in results_dict[method_name][corruption]):
+                acc = results_dict[method_name][corruption][severity]
+                if acc is not None:
+                    row += f" {acc*100:11.2f}%"
+                else:
+                    row += f" {'N/A':>12s}"
+            else:
+                row += f" {'N/A':>12s}"
+        print(row)
+    
+    print("="*100)
+
+
 def save_summary_json(method_averages, category_averages, output_file, exclude_list=None):
     """Save summary statistics to JSON file.
     
@@ -510,7 +636,10 @@ def main():
     )
     
     parser.add_argument('--input', type=str, required=True,
-                       help='Path to input JSON results file')
+                       help='Path to input JSON results file (baseline methods)')
+    parser.add_argument('--csv_input', type=str, 
+                       default='./ablation_studies/visualizations/detailed_results.csv',
+                       help='Path to CSV file with ProtoTTA results')
     parser.add_argument('--output_dir', type=str, default='./plots/robustness_analysis',
                        help='Directory to save output plots')
     parser.add_argument('--severity', type=str, default='5',
@@ -528,10 +657,11 @@ def main():
     if exclude_list:
         print(f"Excluding corruptions: {', '.join(exclude_list)}")
     
-    # Load results
-    print(f"Loading results from: {args.input}")
-    data = load_results(args.input)
-    results_dict = data['results']
+    # Load and merge results
+    print(f"Loading baseline results from: {args.input}")
+    print(f"Loading ProtoTTA results from: {args.csv_input}")
+    results_dict = merge_results(args.input, args.csv_input, severity=args.severity)
+    print(f"Loaded {len(results_dict)} methods: {list(results_dict.keys())}")
     
     # Calculate statistics
     print("Calculating statistics...")
@@ -550,6 +680,7 @@ def main():
     
     # Print summary
     print_summary_table(method_averages, category_averages, exclude_list=exclude_list)
+    print_per_corruption_table(results_dict, severity=args.severity, exclude_list=exclude_list)
     
     # Save summary if requested
     if args.save_summary:

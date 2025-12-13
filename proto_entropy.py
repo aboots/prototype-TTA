@@ -13,7 +13,8 @@ class ProtoEntropy(nn.Module):
                  use_geometric_filter=False, geo_filter_threshold=0.3,
                  consensus_strategy='max', consensus_ratio=0.5,
                  use_ensemble_entropy=False,
-                 source_proto_stats=None, alpha_source_kl=0.0):
+                 source_proto_stats=None, alpha_source_kl=0.0,
+                 adapt_all_prototypes=False):
         """
         Args:
             episodic: If True, uses 'episodic' reset_mode (backward compatibility)
@@ -40,6 +41,8 @@ class ProtoEntropy(nn.Module):
             source_proto_stats: Dict with source prototype activation statistics (mean, std, distribution)
                                Computed on clean/source data before adaptation
             alpha_source_kl: Weight for KL divergence regularization to source distribution (default: 0.0 = disabled)
+            adapt_all_prototypes: If True, adapt based on all prototypes (not just target prototypes matching predicted class)
+                                 If False (default), only adapt target prototypes (original behavior)
         """
         super().__init__()
         self.model = model
@@ -66,6 +69,9 @@ class ProtoEntropy(nn.Module):
         # Source distribution matching parameters
         self.source_proto_stats = source_proto_stats
         self.alpha_source_kl = alpha_source_kl
+        
+        # Adaptation scope parameter
+        self.adapt_all_prototypes = adapt_all_prototypes
         
         # New reset mechanism parameters
         # If reset_mode not specified, infer from episodic flag for backward compatibility
@@ -304,7 +310,15 @@ class ProtoEntropy(nn.Module):
             reliable_mask = torch.ones(logits.shape[0], device=logits.device)
 
         # 4. Masking: Target and Non-target prototypes
-        target_mask = (proto_identities.unsqueeze(0) == pred_class.unsqueeze(1)).float()
+        if self.adapt_all_prototypes:
+            # Adapt all prototypes (not just target prototypes)
+            # Create mask of shape [B, P] with all ones
+            batch_size = logits.shape[0]
+            num_prototypes = proto_identities.shape[0]
+            target_mask = torch.ones(batch_size, num_prototypes, device=logits.device, dtype=torch.float32)
+        else:
+            # Original behavior: only adapt target prototypes (matching predicted class)
+            target_mask = (proto_identities.unsqueeze(0) == pred_class.unsqueeze(1)).float()
         nontarget_mask = 1.0 - target_mask
         
         # Apply sample reliability mask (broadcast to prototype dimension)

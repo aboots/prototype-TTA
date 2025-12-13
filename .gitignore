@@ -52,4 +52,9 @@ tools/__pycache__/deit_features.cpython-38.pyc
 ehthumbs.db
 Thumbs.db
 readme_stash/
-plots/
+plots_v1
+ablation_studies
+ablation_studies_safe
+robustness_results_sev5.json
+robustness_results_sev5.json.backup
+summary_stats.json

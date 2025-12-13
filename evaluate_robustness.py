@@ -92,7 +92,8 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
                         consensus_strategy='max', consensus_ratio=0.5,
                         adaptation_mode='layernorm_only',
                         use_ensemble_entropy=False,
-                        source_proto_stats=None, alpha_source_kl=0.0):
+                        source_proto_stats=None, alpha_source_kl=0.0,
+                        adapt_all_prototypes=False):
     """Set up Prototype Entropy adaptation (without threshold).
     
     Args:
@@ -110,6 +111,7 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         use_ensemble_entropy: Treat sub-prototypes as ensemble
         source_proto_stats: Pre-computed source prototype statistics
         alpha_source_kl: Weight for source KL regularization
+        adapt_all_prototypes: If True, adapt all prototypes (not just target)
     """
     model = proto_entropy.configure_model(model, adaptation_mode=adaptation_mode)
     params, param_names = proto_entropy.collect_params(model, adaptation_mode=adaptation_mode)
@@ -132,7 +134,8 @@ def setup_proto_entropy(model, use_importance=False, use_confidence=False,
         consensus_ratio=consensus_ratio,
         use_ensemble_entropy=use_ensemble_entropy,
         source_proto_stats=source_proto_stats,
-        alpha_source_kl=alpha_source_kl
+        alpha_source_kl=alpha_source_kl,
+        adapt_all_prototypes=adapt_all_prototypes
     )
     return proto_model
 
