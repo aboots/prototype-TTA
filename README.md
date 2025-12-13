@@ -329,17 +329,8 @@ python visualize_class_prototypes.py
 If you use ProtoTTA in your research, please cite:
 
 ```bibtex
-@article{abootorabi2025prototta,
-  title={ProtoTTA: Prototype-Aware Test-Time Adaptation},
-  author={Abootorabi, Mohammad Mahdi},
-  journal={CPSC 532X: Adaptation \& Adaptive Computation},
-  year={2025}
-}
+coming soon
 ```
-
-## License
-
-This project is licensed under the MIT License.
 
 ## Contact
 
