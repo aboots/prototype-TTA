@@ -58,3 +58,11 @@ ablation_studies_safe
 robustness_results_sev5.json
 robustness_results_sev5.json.backup
 summary_stats.json
+robustness_results_sev5-v1.json
+robustness_results_sev5-v1.json.backup
+summary_stats-v1.json
+corruption_visualizations-v1
+results-v1
+corruption_visualizations
+results
+plots
