@@ -6,6 +6,9 @@
 
 **ProtoTTA** (Prototype-Aware Test-Time Adaptation) is a test-time adaptation framework specifically designed for prototype-based neural networks. Unlike standard TTA methods that rely solely on output logits, ProtoTTA leverages intermediate prototype signals to achieve more effective adaptation under distribution shifts.
 
+<img width="2809" height="1453" alt="Picture2 (1)" src="https://github.com/user-attachments/assets/381a6f08-3197-4207-9a0a-0f0092eea5a7" />
+
+
 ## Overview
 
 ProtoTTA minimizes the binary entropy of prototype-similarity distributions, encouraging decisive and semantically meaningful activations. Key features include:
